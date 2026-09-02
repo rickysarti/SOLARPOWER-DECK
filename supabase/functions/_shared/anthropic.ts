@@ -1,3 +1,5 @@
+import { runtimeSecret } from "./db.ts";
+
 export type AgentMessage = { role: "user" | "assistant"; content: string };
 
 type ImageInput = { mediaType: string; data: string };
@@ -8,10 +10,10 @@ export async function askClaude(
   maxTokens = 900,
   image?: ImageInput,
 ): Promise<string> {
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
+  const apiKey = await runtimeSecret("ANTHROPIC_API_KEY");
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not configured");
 
-  const model = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001";
+  const model = await runtimeSecret("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001";
   const apiMessages: unknown[] = messages.map((message, index) => {
     if (!image || index !== messages.length - 1 || message.role !== "user") return message;
     return {

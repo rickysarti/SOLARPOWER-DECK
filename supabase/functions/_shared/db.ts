@@ -1,17 +1,44 @@
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.99.2";
 
 let client: SupabaseClient | undefined;
+const secretCache = new Map<string, Promise<string | null>>();
+
+function serviceRoleKey(): string | undefined {
+  const modern = Deno.env.get("SUPABASE_SECRET_KEYS");
+  if (modern) {
+    try {
+      const parsed = JSON.parse(modern);
+      if (typeof parsed?.default === "string") return parsed.default;
+    } catch {
+      // Fall through to the legacy key supplied by the Edge runtime.
+    }
+  }
+  return Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? undefined;
+}
 
 export function db(): SupabaseClient {
   if (!client) {
     const url = Deno.env.get("SUPABASE_URL");
-    const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const key = serviceRoleKey();
     if (!url || !key) throw new Error("Supabase runtime credentials are missing");
     client = createClient(url, key, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
   }
   return client;
+}
+
+export async function runtimeSecret(name: string): Promise<string | null> {
+  const environmentValue = Deno.env.get(name);
+  if (environmentValue) return environmentValue;
+  if (!secretCache.has(name)) {
+    secretCache.set(name, (async () => {
+      const { data, error } = await db().rpc("agent_get_runtime_secret", { p_name: name });
+      if (error) throw error;
+      return typeof data === "string" && data ? data : null;
+    })());
+  }
+  return await secretCache.get(name)!;
 }
 
 export async function setting(key: string): Promise<string | null> {

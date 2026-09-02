@@ -7,6 +7,9 @@ project_id = "SOLARPOWER-DECK"
 [functions.agent-whatsapp-webhook]
 verify_jwt = false
 
+[functions.agent-sendpulse-webhook]
+verify_jwt = false
+
 [functions.agent-process-queue]
 verify_jwt = false
 

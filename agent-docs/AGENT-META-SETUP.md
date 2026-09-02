@@ -1,7 +1,7 @@
 # Meta WhatsApp Cloud API
 
-El agente usa la API oficial de Meta directamente. SendPulse no participa en el
-nuevo flujo.
+Esta es la guia para la migracion futura desde SendPulse a la API oficial de
+Meta. Actualmente produccion sigue usando SendPulse desde Supabase.
 
 ## Datos necesarios
 
@@ -57,7 +57,7 @@ verify token en Meta y Supabase.
 2. Probar con el numero de prueba de Meta.
 3. Confirmar que los mensajes aparecen en `agent_*` y `chatbot_*`.
 4. Desconectar o migrar el numero desde SendPulse.
-5. Cambiar `agent_settings.bot_enabled` a `true`.
+5. Cambiar `agent_settings.whatsapp_provider` a `meta`.
 
 El bot permanece apagado hasta el ultimo paso, de modo que no responde en
 paralelo con la instalacion actual.

@@ -8,22 +8,23 @@ Storage y Cron. No requiere un servidor Node encendido permanentemente.
 - El codigo Node original sanitizado esta en `agent-legacy-node/` como referencia.
 - La nueva implementacion vive en `supabase/`.
 - Todos los recursos propios usan el prefijo `agent_` o `agent-`.
-- El bot nace desactivado (`agent_settings.bot_enabled = false`) para permitir
-  migrar y probar sin interferir con el sistema actual.
+- Produccion usa SendPulse y el bot se ejecuta enteramente en Supabase.
+- Meta queda implementado como proveedor alternativo para una migracion futura.
 
 ## Flujo
 
-1. Meta envia el webhook a `agent-whatsapp-webhook`.
-2. El webhook valida la firma, guarda el evento y programa un trabajo con 20
+1. SendPulse envia el webhook a `agent-sendpulse-webhook`.
+2. El webhook valida su secreto, guarda el evento y programa un trabajo con 20
    segundos de buffer por contacto.
 3. `agent-process-queue` agrupa mensajes, consulta el historial, llama a Claude
-   y responde mediante WhatsApp Cloud API.
+   y responde mediante la API de WhatsApp de SendPulse.
 4. `agent-cron` corre cada minuto como respaldo, procesa reintentos y avisos de
    agenda.
 
 ## Funciones
 
-- `agent-whatsapp-webhook`: webhook publico de Meta con verificacion HMAC.
+- `agent-sendpulse-webhook`: webhook publico de SendPulse con secreto propio.
+- `agent-whatsapp-webhook`: webhook alternativo de Meta con verificacion HMAC.
 - `agent-process-queue`: procesador interno autenticado por secreto.
 - `agent-cron`: trabajos programados, reintentos y recordatorios.
 - `agent-health`: diagnostico sin exponer secretos ni datos personales.
@@ -39,18 +40,22 @@ desde el CRM actual sigue funcionando.
 
 ## Configuracion
 
-Crear los secretos listados en `.env.example` desde Supabase Dashboard, en
-Project Settings > Edge Functions > Secrets. No se deben guardar tokens en Git.
+Los secretos del agente se guardan cifrados en Supabase Vault con prefijo
+`agent_`. No se guardan tokens en Git ni se exponen al frontend.
 
-El webhook de Meta sera:
+El proveedor se selecciona en `agent_settings.whatsapp_provider`. El webhook de
+SendPulse es `agent-sendpulse-webhook` y su URL contiene el secreto almacenado
+en `agent_settings.sendpulse_webhook_secret`.
+
+El webhook alternativo de Meta es:
 
 `https://ddocohkgabfhsolfarvr.supabase.co/functions/v1/agent-whatsapp-webhook`
 
-Antes del corte definitivo, verificar el webhook y luego activar el bot:
+Para pausar globalmente o reactivar el bot:
 
 ```sql
 update public.agent_settings
-set value = 'true'
+set value = 'false' -- cambiar a true para reactivar
 where key = 'bot_enabled';
 ```
 

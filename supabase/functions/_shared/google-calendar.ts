@@ -1,3 +1,5 @@
+import { runtimeSecret } from "./db.ts";
+
 type CalendarEvent = {
   title: string;
   description?: string | null;
@@ -8,9 +10,9 @@ type CalendarEvent = {
 };
 
 async function accessToken(): Promise<string | null> {
-  const clientId = Deno.env.get("GOOGLE_CLIENT_ID");
-  const clientSecret = Deno.env.get("GOOGLE_CLIENT_SECRET");
-  const refreshToken = Deno.env.get("GOOGLE_REFRESH_TOKEN");
+  const clientId = await runtimeSecret("GOOGLE_CLIENT_ID");
+  const clientSecret = await runtimeSecret("GOOGLE_CLIENT_SECRET");
+  const refreshToken = await runtimeSecret("GOOGLE_REFRESH_TOKEN");
   if (!clientId || !clientSecret || !refreshToken) return null;
 
   const response = await fetch("https://oauth2.googleapis.com/token", {
@@ -31,7 +33,7 @@ async function accessToken(): Promise<string | null> {
 export async function createGoogleEvent(event: CalendarEvent): Promise<string | null> {
   const token = await accessToken();
   if (!token) return null;
-  const calendarId = encodeURIComponent(Deno.env.get("GOOGLE_CALENDAR_ID") ?? "primary");
+  const calendarId = encodeURIComponent(await runtimeSecret("GOOGLE_CALENDAR_ID") ?? "primary");
   const start = new Date(event.date_time);
   const end = new Date(start.getTime() + (event.duration_minutes ?? 60) * 60_000);
   const attendees = (event.attendee_emails ?? "").split(",").map((email) => email.trim()).filter(Boolean)

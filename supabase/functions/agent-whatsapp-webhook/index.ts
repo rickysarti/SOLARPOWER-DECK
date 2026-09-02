@@ -1,4 +1,4 @@
-import { db, json } from "../_shared/db.ts";
+import { db, json, runtimeSecret } from "../_shared/db.ts";
 import { normalizePhone, verifyMetaSignature } from "../_shared/meta.ts";
 import { processDueJobs } from "../_shared/processor.ts";
 
@@ -75,6 +75,7 @@ async function processWebhook(payload: Record<string, any>): Promise<number> {
         const parsed = messageContent(message);
         const { error } = await db().from("agent_inbound_events").upsert({
           provider_message_id: message.id,
+          provider: "meta",
           phone,
           contact_name: names.get(phone) || null,
           message_type: message.type ?? "unknown",
@@ -111,7 +112,7 @@ Deno.serve(async (req: Request) => {
     const mode = url.searchParams.get("hub.mode");
     const token = url.searchParams.get("hub.verify_token");
     const challenge = url.searchParams.get("hub.challenge");
-    if (mode === "subscribe" && token && token === Deno.env.get("META_VERIFY_TOKEN")) {
+    if (mode === "subscribe" && token && token === await runtimeSecret("META_VERIFY_TOKEN")) {
       return new Response(challenge ?? "", { status: 200 });
     }
     return json({ error: "verification_failed" }, 403);

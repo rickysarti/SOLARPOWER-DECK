@@ -1,7 +1,8 @@
 import { analyzeImage, askClaude, classifyContact, type AgentMessage } from "./anthropic.ts";
 import { processAgendaMessage } from "./agenda.ts";
-import { db, setting } from "./db.ts";
-import { downloadMetaMedia, normalizePhone, sendWhatsAppText } from "./meta.ts";
+import { db, runtimeSecret, setting } from "./db.ts";
+import { normalizePhone } from "./meta.ts";
+import { downloadWhatsAppMedia, sendWhatsAppText } from "./whatsapp.ts";
 import { agentSystemPrompt, notificationPrompt } from "./prompts.ts";
 import { readCrmContact, syncActionToCrm, syncContactToCrm, syncMessageToCrm } from "./crm-compat.ts";
 
@@ -33,9 +34,9 @@ function arrayBufferToBase64(bytes: Uint8Array): string {
 }
 
 async function describeAndStoreMedia(event: Record<string, unknown>): Promise<string | null> {
-  const mediaId = String(event.media_id ?? "");
+  const mediaId = String(event.media_id ?? event.media_url ?? "");
   if (!mediaId) return null;
-  const { bytes, mimeType } = await downloadMetaMedia(mediaId);
+  const { bytes, mimeType } = await downloadWhatsAppMedia(event);
   const extension = mimeType.split("/")[1]?.split(";")[0] ?? "bin";
   const path = `${event.phone}/${event.id}.${extension}`;
   const { error: uploadError } = await db().storage.from("agent-files").upload(path, bytes, {
@@ -85,7 +86,7 @@ async function ensureContact(phone: string, name: string | null) {
 }
 
 async function notifyRicardo(contact: Record<string, unknown>, history: AgentMessage[]): Promise<void> {
-  const ricardo = normalizePhone(Deno.env.get("AGENT_RICARDO_PHONE") ?? "");
+  const ricardo = normalizePhone(await runtimeSecret("AGENT_RICARDO_PHONE") ?? "");
   if (!ricardo) return;
   const transcript = history.map((message) => `${message.role}: ${message.content}`).join("\n");
   const alert = await askClaude(
@@ -130,7 +131,7 @@ async function processInbound(phone: string): Promise<void> {
   const parts: string[] = [];
   for (const event of events) {
     if (event.content) parts.push(event.content);
-    if (event.media_id) {
+    if (event.media_id || event.media_url) {
       const description = await describeAndStoreMedia(event);
       if (description) parts.push(description);
     }
@@ -152,9 +153,9 @@ async function processInbound(phone: string): Promise<void> {
     return;
   }
 
-  const agendaPhone = normalizePhone(Deno.env.get("AGENT_AGENDA_PHONE") ?? "");
-  const ricardoPhone = normalizePhone(Deno.env.get("AGENT_RICARDO_PHONE") ?? "");
-  const guillermoPhone = normalizePhone(Deno.env.get("AGENT_GUILLERMO_PHONE") ?? "");
+  const agendaPhone = normalizePhone(await runtimeSecret("AGENT_AGENDA_PHONE") ?? "");
+  const ricardoPhone = normalizePhone(await runtimeSecret("AGENT_RICARDO_PHONE") ?? "");
+  const guillermoPhone = normalizePhone(await runtimeSecret("AGENT_GUILLERMO_PHONE") ?? "");
   let responseText: string;
   if ((agendaPhone && phone === agendaPhone) || (ricardoPhone && phone === ricardoPhone)) {
     const control = incoming.match(/^\s*(tomar|liberar)\s+\+?(\d{8,15})\s*$/i);
@@ -207,7 +208,7 @@ async function processInbound(phone: string): Promise<void> {
     contact_phone: phone,
     role: "assistant",
     content: responseText,
-    model: Deno.env.get("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001",
+    model: await runtimeSecret("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001",
   });
   await syncMessageToCrm({
     phone,
@@ -215,7 +216,7 @@ async function processInbound(phone: string): Promise<void> {
     role: "assistant",
     content: responseText,
     sourceId: outboundId,
-    model: Deno.env.get("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001",
+    model: await runtimeSecret("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001",
   });
   await db().from("agent_inbound_events").update({ processed_at: processedAt, processing_error: null })
     .in("id", events.map((event) => event.id));
@@ -277,7 +278,7 @@ export async function runScheduledTasks(): Promise<Record<string, number>> {
   const queue = await processDueJobs(20);
   let reminders = 0;
   let notifications = 0;
-  const ricardo = normalizePhone(Deno.env.get("AGENT_RICARDO_PHONE") ?? "");
+  const ricardo = normalizePhone(await runtimeSecret("AGENT_RICARDO_PHONE") ?? "");
 
   if (ricardo && (await setting("bot_enabled")) === "true") {
     const now = new Date();
@@ -292,7 +293,7 @@ export async function runScheduledTasks(): Promise<Record<string, number>> {
     }
 
     const { data: pending } = await db().from("agent_pending_notifications").select("*")
-      .eq("sent", false).order("created_at").limit(10);
+      .eq("sent", false).is("archived_at", null).order("created_at").limit(10);
     for (const item of pending ?? []) {
       try {
         await sendWhatsAppText(item.phone, item.message);

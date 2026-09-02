@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SolarPower CRM</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet" />
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', system-ui, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #1e293b; }
+    ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+    .kanban-col { min-width: 220px; max-width: 220px; }
+    .card-hover:hover { transform: translateY(-1px); box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+    .card-hover { transition: all 0.15s ease; }
+    .msg-user { background: #1e40af; border-radius: 12px 12px 4px 12px; }
+    .msg-bot  { background: #1e293b; border-radius: 12px 12px 12px 4px; }
+    .badge { padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; }
+    input, select, textarea { background: #1e293b !important; border-color: #334155 !important; color: #e2e8f0 !important; }
+    input::placeholder, textarea::placeholder { color: #64748b !important; }
+    .tab-active { border-bottom: 2px solid #3b82f6; color: #3b82f6; }
+    .animate-pulse-once { animation: pulse 1s; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+  </style>
+</head>
+<body>
+
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+const API = 'http://localhost:3001/api';
+
+const STAGES = [
+  { id: 'Interesado',                        color: '#3B82F6', bg: 'bg-blue-900',   border: 'border-blue-500',   text: 'text-blue-300',   dot: '🔵' },
+  { id: 'Pendiente enviar presupuesto',       color: '#F59E0B', bg: 'bg-yellow-900', border: 'border-yellow-500', text: 'text-yellow-300', dot: '🟡' },
+  { id: 'Presupuesto enviado',                color: '#8B5CF6', bg: 'bg-purple-900', border: 'border-purple-500', text: 'text-purple-300', dot: '🟣' },
+  { id: 'Visita programada',                  color: '#10B981', bg: 'bg-green-900',  border: 'border-green-500',  text: 'text-green-300',  dot: '📅' },
+  { id: 'Pendiente enviar presupuesto final', color: '#EF4444', bg: 'bg-red-900',    border: 'border-red-500',    text: 'text-red-300',    dot: '🔴' },
+  { id: 'Venta cerrada',                      color: '#059669', bg: 'bg-emerald-900',border: 'border-emerald-500',text: 'text-emerald-300',dot: '✅' },
+  { id: 'Cliente Solarpower',                 color: '#F97316', bg: 'bg-orange-900', border: 'border-orange-500', text: 'text-orange-300', dot: '⭐' },
+];
+
+const stageOf = (label) => STAGES.find(s => s.id === label) || STAGES[0];
+
+function relTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts), now = new Date();
+  const diff = Math.floor((now - d) / 1000);
+  if (diff < 60) return 'hace un momento';
+  if (diff < 3600) return `hace ${Math.floor(diff/60)}m`;
+  if (diff < 86400) return `hace ${Math.floor(diff/3600)}h`;
+  if (diff < 604800) return `hace ${Math.floor(diff/86400)}d`;
+  return d.toLocaleDateString('es-AR');
+}
+
+function fmtDate(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleString('es-AR', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+}
+
+function fmtDateOnly(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleDateString('es-AR', { weekday:'short', day:'2-digit', month:'short', year:'numeric' });
+}
+
+async function api(path, opts = {}) {
+  try {
+    const r = await fetch(API + path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...opts,
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+    return r.ok ? r.json() : { error: await r.text() };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+// ─── TOAST ────────────────────────────────────────────────────────────────────
+function Toast({ msg, type, onClose }) {
+  useEffect(() => { const t = setTimeout(onClose, 3000); return () => clearTimeout(t); }, []);
+  const colors = { success: 'bg-green-700', error: 'bg-red-700', info: 'bg-blue-700' };
+  return (
+    <div className={`fixed bottom-6 right-6 z-50 px-5 py-3 rounded-xl shadow-2xl text-white text-sm font-medium ${colors[type]||colors.info} flex items-center gap-2`}>
+      {type==='success'?'✅':type==='error'?'❌':'ℹ️'} {msg}
+      <button onClick={onClose} className="ml-2 opacity-70 hover:opacity-100">✕</button>
+    </div>
+  );
+}
+
+// ─── BADGE ────────────────────────────────────────────────────────────────────
+function StageBadge({ label, size = 'sm' }) {
+  const s = stageOf(label);
+  const sz = size === 'sm' ? 'text-xs px-2 py-0.5' : 'text-sm px-3 py-1';
+  return (
+    <span className={`badge ${sz} ${s.text}`} style={{ background: s.color + '33', border: `1px solid ${s.color}66` }}>
+      {s.dot} {label}
+    </span>
+  );
+}
+
+// ─── MODAL ────────────────────────────────────────────────────────────────────
+function Modal({ title, onClose, children, wide }) {
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black bg-opacity-70" onClick={e => e.target===e.currentTarget&&onClose()}>
+      <div className={`bg-gray-900 rounded-2xl shadow-2xl border border-gray-700 ${wide?'w-full max-w-2xl':'w-full max-w-md'} mx-4 max-h-screen overflow-y-auto`}>
+        <div className="flex items-center justify-between p-5 border-b border-gray-700">
+          <h3 className="text-lg font-bold text-white">{title}</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-white text-xl">✕</button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SCHEDULE VISIT MODAL ─────────────────────────────────────────────────────
+function ScheduleModal({ contact, onClose, onSuccess }) {
+  const tomorrow = new Date(Date.now() + 86400000);
+  tomorrow.setHours(10, 0, 0, 0);
+  const [form, setForm] = useState({
+    title: `Visita — ${contact.name || contact.phone}`,
+    date_time: tomorrow.toISOString().slice(0, 16),
+    duration_minutes: 90,
+    location: contact.locality || '',
+    description: '',
+    event_type: 'visita',
+    add_to_gcal: true
+  });
+  const [loading, setLoading] = useState(false);
+
+  const submit = async () => {
+    setLoading(true);
+    const r = await api('/agenda', {
+      method: 'POST',
+      body: { ...form, contact_name: contact.name || contact.phone, contact_phone: contact.phone }
+    });
+    setLoading(false);
+    if (r.error) alert('Error: ' + r.error);
+    else { onSuccess(r); onClose(); }
+  };
+
+  return (
+    <Modal title="📅 Agendar visita" onClose={onClose}>
+      <div className="space-y-4">
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Título</label>
+          <input className="w-full rounded-lg border p-2 text-sm" value={form.title} onChange={e=>setForm({...form,title:e.target.value})} />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Fecha y hora</label>
+            <input type="datetime-local" className="w-full rounded-lg border p-2 text-sm" value={form.date_time} onChange={e=>setForm({...form,date_time:e.target.value})} />
+          </div>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Duración (min)</label>
+            <select className="w-full rounded-lg border p-2 text-sm" value={form.duration_minutes} onChange={e=>setForm({...form,duration_minutes:parseInt(e.target.value)})}>
+              <option value={60}>1 hora</option><option value={90}>1:30 hs</option>
+              <option value={120}>2 horas</option><option value={480}>Día completo (8hs)</option>
+            </select>
+          </div>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Tipo</label>
+          <select className="w-full rounded-lg border p-2 text-sm" value={form.event_type} onChange={e=>setForm({...form,event_type:e.target.value})}>
+            <option value="visita">Visita técnica</option>
+            <option value="instalacion">Instalación</option>
+            <option value="reunion">Reunión</option>
+            <option value="llamada">Llamada</option>
+            <option value="otro">Otro</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Ubicación</label>
+          <input className="w-full rounded-lg border p-2 text-sm" value={form.location} onChange={e=>setForm({...form,location:e.target.value})} placeholder="Dirección..." />
+        </div>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">Notas</label>
+          <textarea className="w-full rounded-lg border p-2 text-sm" rows={3} value={form.description} onChange={e=>setForm({...form,description:e.target.value})} placeholder="Detalles del evento..." />
+        </div>
+        <label className="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" checked={form.add_to_gcal} onChange={e=>setForm({...form,add_to_gcal:e.target.checked})} className="rounded" />
+          <span>Agregar a Google Calendar</span>
+          <span className="text-xs text-gray-400">(riki@sarti.com.ar)</span>
+        </label>
+        <button onClick={submit} disabled={loading} className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-xl py-2.5 font-semibold">
+          {loading ? '⏳ Agendando...' : '📅 Confirmar visita'}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── CONTACT DETAIL ───────────────────────────────────────────────────────────
+function ContactDetail({ phone, onClose, onUpdate, showToast }) {
+  const [contact, setContact] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [tab, setTab] = useState('conv');
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(false);
+  const [notesDraft, setNotesDraft] = useState('');
+  const [showSchedule, setShowSchedule] = useState(false);
+  const msgEndRef = useRef();
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const [c, m] = await Promise.all([
+      api(`/contacts/${phone}`),
+      api(`/contacts/${phone}/messages?limit=80`)
+    ]);
+    setContact(c);
+    setMessages(Array.isArray(m) ? m : []);
+    setNotesDraft(c.notes || '');
+    setLoading(false);
+  }, [phone]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+
+  const update = async (fields) => {
+    const r = await api(`/contacts/${phone}`, { method: 'PATCH', body: fields });
+    if (!r.error) { setContact(r); onUpdate(r); showToast('Actualizado ✅', 'success'); }
+    else showToast('Error: ' + r.error, 'error');
+  };
+
+  const togglePause = () => update({ human_mode: contact.human_mode ? 0 : 1 });
+  const resolveAction = async (id) => {
+    await api(`/pending-actions/${id}`, { method: 'PATCH' });
+    load();
+    showToast('Acción resuelta', 'success');
+  };
+
+  if (loading) return (
+    <div className="flex items-center justify-center h-full text-gray-400">
+      <div className="text-center">⏳ Cargando...</div>
+    </div>
+  );
+
+  if (!contact) return null;
+  const stage = stageOf(contact.label);
+
+  return (
+    <div className="flex flex-col h-full">
+      {showSchedule && <ScheduleModal contact={contact} onClose={() => setShowSchedule(false)} onSuccess={() => { showToast('Visita agendada ✅', 'success'); load(); }} />}
+
+      {/* Header */}
+      <div className="p-4 border-b border-gray-700 flex items-start justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-12 h-12 rounded-full flex items-center justify-center text-xl font-bold" style={{ background: stage.color + '33' }}>
+            {contact.name ? contact.name[0].toUpperCase() : '?'}
+          </div>
+          <div>
+            <div className="font-bold text-white text-base">{contact.name || 'Sin nombre'}</div>
+            <div className="text-gray-400 text-xs">+{contact.phone}</div>
+            <div className="mt-1"><StageBadge label={contact.label} /></div>
+          </div>
+        </div>
+        <button onClick={onClose} className="text-gray-400 hover:text-white text-xl ml-2">✕</button>
+      </div>
+
+      {/* Quick actions */}
+      <div className="px-4 py-2 flex gap-2 flex-wrap border-b border-gray-700">
+        <button onClick={togglePause}
+          className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-colors ${contact.human_mode ? 'bg-green-700 hover:bg-green-600' : 'bg-yellow-700 hover:bg-yellow-600'}`}>
+          {contact.human_mode ? '▶ Reactivar bot' : '⏸ Pausar bot'}
+        </button>
+        <button onClick={() => setShowSchedule(true)} className="text-xs px-3 py-1.5 rounded-lg bg-blue-700 hover:bg-blue-600 font-medium">
+          📅 Agendar visita
+        </button>
+        <a href={`https://wa.me/${contact.phone}`} target="_blank" rel="noreferrer"
+          className="text-xs px-3 py-1.5 rounded-lg bg-green-800 hover:bg-green-700 font-medium">
+          💬 WhatsApp
+        </a>
+      </div>
+
+      {/* Stage selector */}
+      <div className="px-4 py-3 border-b border-gray-700">
+        <label className="block text-xs text-gray-400 mb-1.5">Estado del lead</label>
+        <select className="w-full rounded-lg border p-2 text-sm"
+          value={contact.label}
+          onChange={e => update({ label: e.target.value })}>
+          {STAGES.map(s => <option key={s.id} value={s.id}>{s.dot} {s.id}</option>)}
+        </select>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex border-b border-gray-700 text-sm">
+        {[['conv','💬 Conversación'],['datos','📋 Datos'],['actions','⚡ Pendientes'],['agenda','📅 Agenda']].map(([t,l]) => (
+          <button key={t} onClick={()=>setTab(t)}
+            className={`px-4 py-2.5 font-medium transition-colors hover:text-white ${tab===t?'tab-active text-blue-400':'text-gray-400'}`}>
+            {l}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      <div className="flex-1 overflow-y-auto">
+
+        {/* CONVERSACIÓN */}
+        {tab === 'conv' && (
+          <div className="p-3 space-y-2">
+            {messages.length === 0 && <p className="text-gray-500 text-center py-8">Sin mensajes</p>}
+            {messages.map((m, i) => (
+              <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-xs px-3 py-2 text-sm ${m.role === 'user' ? 'msg-user' : 'msg-bot'}`}>
+                  <div className="text-gray-200 leading-relaxed">{m.content}</div>
+                  <div className="text-gray-500 text-xs mt-1 text-right">{relTime(m.timestamp)}</div>
+                </div>
+              </div>
+            ))}
+            <div ref={msgEndRef} />
+          </div>
+        )}
+
+        {/* DATOS */}
+        {tab === 'datos' && (
+          <div className="p-4 space-y-4">
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                ['Email',           contact.email           || '—'],
+                ['📍 Localidad',    contact.locality        || '—'],
+                ['🏠 Techo',        contact.roof_type       || '—'],
+                ['⚡ Conexión',     contact.connection_type  || '—'],
+                ['🌞 Interés',      contact.product_interest || '—'],
+                ['📄 Factura',      contact.bill_received ? '✅ Recibida' : '❌ Sin factura'],
+                ['📅 Primer contacto', fmtDate(contact.first_contact)],
+                ['🕐 Último contacto', fmtDate(contact.last_contact)],
+                ['🤖 Bot',          contact.human_mode ? '⏸ PAUSADO' : '▶ Activo'],
+              ].map(([k, v]) => (
+                <div key={k} className="bg-gray-800 rounded-xl p-3">
+                  <div className="text-xs text-gray-400 mb-0.5">{k}</div>
+                  <div className="text-sm text-white font-medium">{v}</div>
+                </div>
+              ))}
+            </div>
+
+            <div>
+              <label className="block text-xs text-gray-400 mb-1.5">📝 Notas internas</label>
+              <textarea className="w-full rounded-xl border p-3 text-sm" rows={4}
+                value={notesDraft} onChange={e => setNotesDraft(e.target.value)}
+                placeholder="Agregar notas sobre este contacto..." />
+              <button onClick={() => update({ notes: notesDraft })}
+                className="mt-2 text-xs bg-blue-700 hover:bg-blue-600 px-4 py-1.5 rounded-lg">
+                💾 Guardar notas
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* PENDIENTES */}
+        {tab === 'actions' && (
+          <div className="p-4 space-y-2">
+            {(!contact.pending_actions || contact.pending_actions.length === 0) && (
+              <p className="text-gray-500 text-center py-8">Sin acciones pendientes</p>
+            )}
+            {(contact.pending_actions || []).map(a => (
+              <div key={a.id} className={`p-3 rounded-xl border flex items-start gap-3 ${a.resolved ? 'border-gray-700 opacity-50' : 'border-yellow-700 bg-yellow-900 bg-opacity-20'}`}>
+                <div className="flex-1">
+                  <div className="text-xs font-bold text-yellow-300">{a.action_type}</div>
+                  <div className="text-sm text-gray-200 mt-0.5">{a.description}</div>
+                  <div className="text-xs text-gray-500 mt-1">{fmtDate(a.created_at)}</div>
+                </div>
+                {!a.resolved && (
+                  <button onClick={() => resolveAction(a.id)}
+                    className="text-xs bg-green-700 hover:bg-green-600 px-3 py-1.5 rounded-lg shrink-0">
+                    ✅ Resolver
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* AGENDA */}
+        {tab === 'agenda' && (
+          <div className="p-4 space-y-2">
+            <button onClick={() => setShowSchedule(true)}
+              className="w-full border border-dashed border-blue-600 rounded-xl py-2.5 text-blue-400 text-sm hover:bg-blue-900 hover:bg-opacity-20 mb-3">
+              + Agendar nueva visita
+            </button>
+            {(!contact.agenda_events || contact.agenda_events.length === 0) && (
+              <p className="text-gray-500 text-center py-4">Sin eventos en agenda</p>
+            )}
+            {(contact.agenda_events || []).map(ev => (
+              <div key={ev.id} className="p-3 rounded-xl border border-gray-700 bg-gray-800">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <div className="text-sm font-semibold text-white">{ev.title}</div>
+                    <div className="text-xs text-blue-300 mt-0.5">{fmtDateOnly(ev.date_time)} — {ev.duration_minutes} min</div>
+                    {ev.location && <div className="text-xs text-gray-400 mt-0.5">📍 {ev.location}</div>}
+                  </div>
+                  <span className={`badge text-xs px-2 py-0.5 ${ev.status==='pendiente'?'bg-blue-900 text-blue-300':ev.status==='completado'?'bg-green-900 text-green-300':'bg-red-900 text-red-300'}`}>
+                    {ev.status}
+                  </span>
+                </div>
+                {ev.google_event_id && <div className="text-xs text-gray-500 mt-1.5">🗓 En Google Calendar</div>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── KANBAN BOARD ──────────────────────────────────────────────────────────────
+function KanbanBoard({ contacts, onSelectContact, onUpdate, showToast }) {
+  const grouped = {};
+  STAGES.forEach(s => { grouped[s.id] = []; });
+  contacts.forEach(c => {
+    const key = c.label || 'Interesado';
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(c);
+  });
+
+  const moveTo = async (phone, newLabel) => {
+    const r = await api(`/contacts/${phone}`, { method: 'PATCH', body: { label: newLabel } });
+    if (!r.error) { onUpdate(r); showToast(`Movido a "${newLabel}"`, 'success'); }
+  };
+
+  return (
+    <div className="flex gap-3 overflow-x-auto pb-4 pt-2 px-4 h-full">
+      {STAGES.map(stage => (
+        <div key={stage.id} className="kanban-col flex flex-col">
+          <div className={`rounded-t-xl px-3 py-2.5 border-t border-l border-r ${stage.border} flex items-center justify-between`}
+               style={{ background: stage.color + '1a' }}>
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">{stage.dot}</span>
+              <span className={`text-xs font-bold ${stage.text}`}>{stage.id}</span>
+            </div>
+            <span className={`text-xs font-bold ${stage.text} opacity-70`}>{grouped[stage.id]?.length || 0}</span>
+          </div>
+          <div className={`flex-1 overflow-y-auto space-y-2 p-2 rounded-b-xl border-b border-l border-r ${stage.border}`}
+               style={{ background: '#0f172a', minHeight: 200, maxHeight: 'calc(100vh - 240px)' }}>
+            {(grouped[stage.id] || []).map(c => (
+              <div key={c.phone}
+                className="card-hover bg-gray-800 rounded-xl p-3 cursor-pointer border border-gray-700 hover:border-gray-500"
+                onClick={() => onSelectContact(c.phone)}>
+                <div className="flex items-start justify-between gap-1">
+                  <div className="font-semibold text-white text-xs truncate">{c.name || 'Sin nombre'}</div>
+                  {c.human_mode ? <span className="text-yellow-400 text-xs shrink-0">⏸</span> : null}
+                </div>
+                <div className="text-gray-500 text-xs mt-0.5 truncate">+{c.phone}</div>
+                {c.locality && <div className="text-gray-400 text-xs mt-1">📍 {c.locality}</div>}
+                {c.last_message && (
+                  <div className="text-gray-500 text-xs mt-1.5 line-clamp-2 italic">"{c.last_message.substring(0,60)}..."</div>
+                )}
+                <div className="flex items-center justify-between mt-2">
+                  <span className="text-gray-600 text-xs">{relTime(c.last_contact)}</span>
+                  {c.pending_count > 0 && (
+                    <span className="bg-red-800 text-red-200 text-xs px-1.5 py-0.5 rounded-full">⚡{c.pending_count}</span>
+                  )}
+                </div>
+
+                {/* Move buttons */}
+                <div className="mt-2 flex gap-1 flex-wrap">
+                  {STAGES.filter(s => s.id !== c.label).slice(0,2).map(s => (
+                    <button key={s.id} onClick={e => { e.stopPropagation(); moveTo(c.phone, s.id); }}
+                      className="text-xs px-2 py-0.5 rounded-lg hover:opacity-80 transition-opacity"
+                      style={{ background: s.color + '33', color: s.color }}
+                      title={`Mover a: ${s.id}`}>
+                      {s.dot}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {(grouped[stage.id] || []).length === 0 && (
+              <div className="text-center text-gray-600 text-xs py-6">Vacío</div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── CONTACT LIST ─────────────────────────────────────────────────────────────
+function ContactList({ contacts, onSelectContact }) {
+  const [search, setSearch] = useState('');
+  const filtered = contacts.filter(c => {
+    const q = search.toLowerCase();
+    return !q || (c.name||'').toLowerCase().includes(q) || c.phone.includes(q) || (c.locality||'').toLowerCase().includes(q);
+  });
+
+  return (
+    <div className="p-4 h-full flex flex-col">
+      <input className="rounded-xl border p-2.5 text-sm mb-4 w-full" placeholder="🔍 Buscar por nombre, teléfono o localidad..."
+        value={search} onChange={e => setSearch(e.target.value)} />
+      <div className="flex-1 overflow-y-auto space-y-1.5">
+        {filtered.map(c => {
+          const s = stageOf(c.label);
+          return (
+            <div key={c.phone} onClick={() => onSelectContact(c.phone)}
+              className="card-hover flex items-center gap-3 p-3 rounded-xl bg-gray-800 cursor-pointer border border-gray-700 hover:border-gray-500">
+              <div className="w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold shrink-0"
+                style={{ background: s.color + '33', color: s.color }}>
+                {c.name ? c.name[0].toUpperCase() : '?'}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-sm text-white truncate">{c.name || 'Sin nombre'}</span>
+                  {c.human_mode ? <span className="text-yellow-400 text-xs">⏸</span> : null}
+                </div>
+                <div className="text-gray-400 text-xs">+{c.phone}</div>
+              </div>
+              <div className="text-right shrink-0 space-y-1">
+                <StageBadge label={c.label} />
+                <div className="text-gray-600 text-xs">{relTime(c.last_contact)}</div>
+              </div>
+              {c.pending_count > 0 && (
+                <span className="bg-red-800 text-red-200 text-xs px-2 py-0.5 rounded-full shrink-0">⚡{c.pending_count}</span>
+              )}
+            </div>
+          );
+        })}
+        {filtered.length === 0 && <p className="text-center text-gray-500 py-12">Sin resultados</p>}
+      </div>
+    </div>
+  );
+}
+
+// ─── AGENDA VIEW ──────────────────────────────────────────────────────────────
+function AgendaView({ showToast }) {
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showNew, setShowNew] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const from = new Date(Date.now() - 3 * 86400000).toISOString().split('T')[0];
+    const to   = new Date(Date.now() + 30 * 86400000).toISOString().split('T')[0];
+    const r = await api(`/agenda?from=${from}&to=${to}`);
+    setEvents(Array.isArray(r) ? r : []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const cancelEvent = async (id) => {
+    if (!confirm('¿Cancelar este evento?')) return;
+    await api(`/agenda/${id}`, { method: 'DELETE' });
+    showToast('Evento cancelado', 'info');
+    load();
+  };
+
+  const typeIcon = { visita: '🏠', instalacion: '🔧', reunion: '🤝', llamada: '📞', recordatorio: '🔔', otro: '📌' };
+
+  const groupedByDate = {};
+  events.forEach(ev => {
+    const d = new Date(ev.date_time).toLocaleDateString('es-AR', { weekday:'long', day:'2-digit', month:'long' });
+    if (!groupedByDate[d]) groupedByDate[d] = [];
+    groupedByDate[d].push(ev);
+  });
+
+  return (
+    <div className="p-4 h-full flex flex-col">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-lg font-bold">📅 Agenda</h2>
+        <button onClick={() => setShowNew(true)} className="bg-blue-600 hover:bg-blue-500 text-white text-sm px-4 py-2 rounded-xl font-medium">
+          + Nuevo evento
+        </button>
+      </div>
+
+      {showNew && (
+        <Modal title="Nuevo evento" onClose={() => setShowNew(false)}>
+          <QuickEventForm onSubmit={async (form) => {
+            const r = await api('/agenda', { method: 'POST', body: form });
+            if (!r.error) { showToast('Evento creado ✅', 'success'); setShowNew(false); load(); }
+            else showToast('Error: ' + r.error, 'error');
+          }} />
+        </Modal>
+      )}
+
+      <div className="flex-1 overflow-y-auto space-y-4">
+        {loading && <p className="text-gray-400 text-center py-8">Cargando...</p>}
+        {!loading && Object.keys(groupedByDate).length === 0 && (
+          <p className="text-gray-500 text-center py-12">No hay eventos próximos</p>
+        )}
+        {Object.entries(groupedByDate).map(([date, evs]) => {
+          const isToday = new Date(evs[0].date_time).toDateString() === new Date().toDateString();
+          return (
+            <div key={date}>
+              <div className={`text-xs font-bold uppercase tracking-wider mb-2 px-1 ${isToday ? 'text-blue-400' : 'text-gray-400'}`}>
+                {isToday ? '🔵 HOY — ' : ''}{date}
+              </div>
+              <div className="space-y-2">
+                {evs.map(ev => (
+                  <div key={ev.id} className={`p-3 rounded-xl border ${ev.status==='cancelado'?'border-gray-700 opacity-40':'border-gray-700 bg-gray-800'}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-start gap-2 flex-1 min-w-0">
+                        <span className="text-xl shrink-0">{typeIcon[ev.event_type]||'📌'}</span>
+                        <div className="min-w-0">
+                          <div className="font-semibold text-white text-sm">{ev.title}</div>
+                          <div className="text-blue-300 text-xs mt-0.5">
+                            {new Date(ev.date_time).toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'})} — {ev.duration_minutes} min
+                          </div>
+                          {ev.location && <div className="text-gray-400 text-xs mt-0.5">📍 {ev.location}</div>}
+                          {ev.contact_name && <div className="text-gray-400 text-xs">👤 {ev.contact_name}</div>}
+                          {ev.description && <div className="text-gray-500 text-xs mt-1 italic">{ev.description}</div>}
+                          {ev.google_event_id && <div className="text-green-500 text-xs mt-1">🗓 En Google Calendar</div>}
+                        </div>
+                      </div>
+                      <div className="flex flex-col items-end gap-1 shrink-0">
+                        <span className={`badge text-xs ${ev.status==='pendiente'?'bg-blue-900 text-blue-300':ev.status==='completado'?'bg-green-900 text-green-300':'bg-gray-700 text-gray-400'}`}>
+                          {ev.status}
+                        </span>
+                        {ev.status !== 'cancelado' && (
+                          <button onClick={() => cancelEvent(ev.id)} className="text-xs text-red-400 hover:text-red-300 mt-1">✕ Cancelar</button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function QuickEventForm({ onSubmit }) {
+  const tomorrow = new Date(Date.now() + 86400000);
+  tomorrow.setHours(10, 0, 0, 0);
+  const [form, setForm] = useState({
+    title: '', date_time: tomorrow.toISOString().slice(0,16),
+    duration_minutes: 90, location: '', description: '', event_type: 'visita',
+    contact_name: '', contact_phone: '', add_to_gcal: true
+  });
+  const [loading, setLoading] = useState(false);
+  const submit = async () => { setLoading(true); await onSubmit(form); setLoading(false); };
+  return (
+    <div className="space-y-3">
+      <input className="w-full rounded-lg border p-2 text-sm" placeholder="Título del evento" value={form.title} onChange={e=>setForm({...form,title:e.target.value})} />
+      <div className="grid grid-cols-2 gap-2">
+        <input type="datetime-local" className="w-full rounded-lg border p-2 text-sm" value={form.date_time} onChange={e=>setForm({...form,date_time:e.target.value})} />
+        <select className="w-full rounded-lg border p-2 text-sm" value={form.event_type} onChange={e=>setForm({...form,event_type:e.target.value})}>
+          <option value="visita">Visita técnica</option><option value="instalacion">Instalación</option>
+          <option value="reunion">Reunión</option><option value="llamada">Llamada</option><option value="otro">Otro</option>
+        </select>
+      </div>
+      <input className="w-full rounded-lg border p-2 text-sm" placeholder="Contacto (nombre)" value={form.contact_name} onChange={e=>setForm({...form,contact_name:e.target.value})} />
+      <input className="w-full rounded-lg border p-2 text-sm" placeholder="Teléfono del contacto" value={form.contact_phone} onChange={e=>setForm({...form,contact_phone:e.target.value})} />
+      <input className="w-full rounded-lg border p-2 text-sm" placeholder="Ubicación" value={form.location} onChange={e=>setForm({...form,location:e.target.value})} />
+      <textarea className="w-full rounded-lg border p-2 text-sm" rows={2} placeholder="Notas" value={form.description} onChange={e=>setForm({...form,description:e.target.value})} />
+      <label className="flex items-center gap-2 text-sm cursor-pointer">
+        <input type="checkbox" checked={form.add_to_gcal} onChange={e=>setForm({...form,add_to_gcal:e.target.checked})} />
+        <span>Agregar a Google Calendar</span>
+      </label>
+      <button onClick={submit} disabled={loading||!form.title} className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-xl py-2.5 font-semibold text-sm">
+        {loading ? '⏳ Guardando...' : '✅ Crear evento'}
+      </button>
+    </div>
+  );
+}
+
+// ─── PENDING ACTIONS VIEW ────────────────────────────────────────────────────
+function PendingActionsView({ onSelectContact, showToast }) {
+  const [actions, setActions] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const r = await api('/pending-actions');
+    setActions(Array.isArray(r) ? r : []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const resolve = async (id) => {
+    await api(`/pending-actions/${id}`, { method: 'PATCH' });
+    showToast('Acción resuelta ✅', 'success');
+    load();
+  };
+
+  const actionIcon = { send_budget: '💰', call: '📞', visit: '🏠', support: '🛠', default: '⚡' };
+
+  return (
+    <div className="p-4 h-full flex flex-col">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-lg font-bold">⚡ Acciones Pendientes</h2>
+        <span className="bg-red-800 text-red-200 text-sm px-3 py-1 rounded-full font-bold">{actions.length}</span>
+      </div>
+      <div className="flex-1 overflow-y-auto space-y-2">
+        {loading && <p className="text-gray-400 text-center py-8">Cargando...</p>}
+        {!loading && actions.length === 0 && (
+          <div className="text-center py-16">
+            <div className="text-5xl mb-3">🎉</div>
+            <p className="text-gray-400">¡Todo al día! No hay acciones pendientes.</p>
+          </div>
+        )}
+        {actions.map(a => (
+          <div key={a.id} className="p-4 rounded-xl border border-yellow-800 bg-yellow-900 bg-opacity-20 flex items-start gap-3">
+            <span className="text-2xl shrink-0">{actionIcon[a.action_type] || actionIcon.default}</span>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-yellow-300 uppercase">{a.action_type}</span>
+                {a.contact_label && <StageBadge label={a.contact_label} size="xs" />}
+              </div>
+              <button onClick={() => onSelectContact(a.contact_phone)}
+                className="text-sm font-semibold text-white hover:text-blue-300 mt-0.5 text-left">
+                {a.contact_name || a.contact_phone}
+              </button>
+              <p className="text-sm text-gray-300 mt-1">{a.description}</p>
+              <p className="text-xs text-gray-500 mt-1.5">{fmtDate(a.created_at)}</p>
+            </div>
+            <button onClick={() => resolve(a.id)} className="text-xs bg-green-700 hover:bg-green-600 px-3 py-1.5 rounded-lg shrink-0 font-medium">
+              ✅ Resolver
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── DASHBOARD STATS ──────────────────────────────────────────────────────────
+function Dashboard({ stats, onNavigate }) {
+  if (!stats) return <div className="p-8 text-center text-gray-500">Cargando estadísticas...</div>;
+
+  return (
+    <div className="p-6 space-y-6">
+      <h2 className="text-xl font-bold">🏠 Dashboard</h2>
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        {[
+          { label: 'Total leads', value: stats.total,   icon: '👥', color: 'border-blue-600' },
+          { label: 'Activos hoy', value: stats.today,   icon: '📲', color: 'border-green-600' },
+          { label: 'Bot pausado', value: stats.paused,  icon: '⏸',  color: 'border-yellow-600' },
+          { label: 'Pendientes',  value: stats.pending, icon: '⚡',  color: 'border-red-600' },
+        ].map(s => (
+          <div key={s.label} className={`bg-gray-800 rounded-2xl p-4 border-l-4 ${s.color}`}>
+            <div className="text-3xl mb-1">{s.icon}</div>
+            <div className="text-3xl font-black text-white">{s.value}</div>
+            <div className="text-sm text-gray-400 mt-0.5">{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div>
+        <h3 className="text-sm font-bold text-gray-300 mb-3">Pipeline de ventas</h3>
+        <div className="space-y-2">
+          {STAGES.map(stage => {
+            const count = stats.byLabel?.find(b => b.label === stage.id)?.n || 0;
+            const pct = stats.total > 0 ? Math.round((count/stats.total)*100) : 0;
+            return (
+              <button key={stage.id} onClick={() => onNavigate('contacts', stage.id)}
+                className="w-full flex items-center gap-3 p-3 bg-gray-800 rounded-xl hover:bg-gray-700 transition-colors text-left">
+                <span className="text-base">{stage.dot}</span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-sm text-white truncate">{stage.id}</span>
+                    <span className="text-sm font-bold text-white ml-2">{count}</span>
+                  </div>
+                  <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                    <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: stage.color }} />
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div className="bg-gray-800 rounded-2xl p-4">
+          <div className="text-sm text-gray-400 mb-1">Mensajes hoy</div>
+          <div className="text-2xl font-bold text-white">{stats.msgToday}</div>
+        </div>
+        <div className="bg-gray-800 rounded-2xl p-4">
+          <div className="text-sm text-gray-400 mb-1">Próximos eventos</div>
+          <div className="text-2xl font-bold text-white">{stats.upcoming}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+function App() {
+  const [view, setView] = useState('dashboard');
+  const [filterLabel, setFilterLabel] = useState(null);
+  const [contacts, setContacts] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [selectedPhone, setSelectedPhone] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [botPaused, setBotPaused] = useState(false);
+  const [apiOnline, setApiOnline] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const showToast = (msg, type = 'info') => setToast({ msg, type });
+
+  const loadAll = useCallback(async () => {
+    const [c, s, bs] = await Promise.all([
+      api('/contacts?limit=500'),
+      api('/stats'),
+      api('/bot/status')
+    ]);
+    if (Array.isArray(c)) setContacts(c);
+    if (s && !s.error) setStats(s);
+    if (bs && !bs.error) setBotPaused(bs.paused);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    // Check API health
+    api('/health').then(r => {
+      setApiOnline(!r.error);
+      if (!r.error) loadAll();
+      else setLoading(false);
+    });
+    // Refresh every 30s
+    const interval = setInterval(loadAll, 30000);
+    return () => clearInterval(interval);
+  }, [loadAll]);
+
+  const updateContact = (updated) => {
+    setContacts(prev => prev.map(c => c.phone === updated.phone ? { ...c, ...updated } : c));
+    setStats(null); // trigger reload
+    api('/stats').then(s => { if (s && !s.error) setStats(s); });
+  };
+
+  const handleSelectContact = (phone) => {
+    setSelectedPhone(phone);
+  };
+
+  const navigateTo = (v, label = null) => {
+    setView(v);
+    setFilterLabel(label);
+    setSelectedPhone(null);
+  };
+
+  const toggleBotPause = async () => {
+    const r = await api('/bot/pause', { method: 'POST', body: { paused: !botPaused } });
+    if (!r.error) { setBotPaused(r.paused); showToast(r.paused ? '⏸ Bot pausado globalmente' : '▶ Bot reactivado', 'info'); }
+  };
+
+  const navItems = [
+    { id: 'dashboard', label: 'Dashboard',   icon: '🏠' },
+    { id: 'kanban',    label: 'Pipeline',     icon: '📊' },
+    { id: 'contacts',  label: 'Contactos',    icon: '👥' },
+    { id: 'agenda',    label: 'Agenda',       icon: '📅' },
+    { id: 'actions',   label: 'Pendientes',   icon: '⚡' },
+  ];
+
+  const filteredContacts = filterLabel ? contacts.filter(c => c.label === filterLabel) : contacts;
+
+  // API offline screen
+  if (apiOnline === false) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center max-w-md">
+          <div className="text-6xl mb-4">⚠️</div>
+          <h1 className="text-2xl font-bold text-white mb-2">CRM API no disponible</h1>
+          <p className="text-gray-400 mb-6">No se puede conectar con <code className="text-blue-400">http://localhost:3001</code></p>
+          <div className="bg-gray-800 rounded-xl p-4 text-left text-sm text-gray-300 mb-4">
+            <p className="font-bold text-white mb-2">Para iniciar el servidor:</p>
+            <code className="text-green-400">cd solarpower-agent</code><br/>
+            <code className="text-green-400">node crm-api.js</code>
+          </div>
+          <button onClick={() => { setApiOnline(null); api('/health').then(r => { setApiOnline(!r.error); if (!r.error) loadAll(); }); }}
+            className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2.5 rounded-xl font-medium">
+            🔄 Reintentar
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-screen overflow-hidden">
+      {toast && <Toast {...toast} onClose={() => setToast(null)} />}
+
+      {/* Sidebar */}
+      <div className="w-56 bg-gray-900 border-r border-gray-800 flex flex-col shrink-0">
+        <div className="p-4 border-b border-gray-800">
+          <div className="flex items-center gap-2">
+            <span className="text-2xl">🌞</span>
+            <div>
+              <div className="font-black text-white text-sm">SolarPower</div>
+              <div className="text-xs text-gray-500">CRM v1.0</div>
+            </div>
+          </div>
+        </div>
+
+        <nav className="flex-1 p-2 space-y-1">
+          {navItems.map(item => (
+            <button key={item.id} onClick={() => navigateTo(item.id)}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                view === item.id ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'
+              }`}>
+              <span>{item.icon}</span> {item.label}
+              {item.id === 'actions' && stats?.pending > 0 && (
+                <span className="ml-auto bg-red-600 text-white text-xs px-1.5 py-0.5 rounded-full">{stats.pending}</span>
+              )}
+            </button>
+          ))}
+        </nav>
+
+        <div className="p-3 border-t border-gray-800 space-y-2">
+          <button onClick={toggleBotPause}
+            className={`w-full text-xs px-3 py-2 rounded-xl font-medium transition-colors ${botPaused ? 'bg-green-700 hover:bg-green-600 text-white' : 'bg-yellow-700 hover:bg-yellow-600 text-white'}`}>
+            {botPaused ? '▶ Reactivar bot' : '⏸ Pausar bot global'}
+          </button>
+          <div className={`text-xs text-center px-2 py-1 rounded-lg ${apiOnline ? 'text-green-400' : 'text-red-400'}`}>
+            {apiOnline ? '🟢 API online' : '🔴 API offline'}
+          </div>
+        </div>
+      </div>
+
+      {/* Main */}
+      <div className={`flex-1 overflow-hidden flex flex-col ${selectedPhone ? 'mr-0' : ''}`}>
+        <div className={`flex flex-1 overflow-hidden`}>
+          <div className={`flex-1 overflow-hidden ${selectedPhone ? 'border-r border-gray-800' : ''}`}>
+            {loading ? (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center text-gray-400">
+                  <div className="text-4xl mb-2 animate-spin">🌞</div>
+                  <p>Cargando CRM...</p>
+                </div>
+              </div>
+            ) : (
+              <>
+                {view === 'dashboard' && <div className="h-full overflow-y-auto"><Dashboard stats={stats} onNavigate={navigateTo} /></div>}
+                {view === 'kanban'    && <div className="h-full overflow-hidden"><KanbanBoard contacts={contacts} onSelectContact={handleSelectContact} onUpdate={updateContact} showToast={showToast} /></div>}
+                {view === 'contacts'  && <div className="h-full overflow-hidden"><ContactList contacts={filteredContacts} onSelectContact={handleSelectContact} /></div>}
+                {view === 'agenda'    && <div className="h-full overflow-y-auto"><AgendaView showToast={showToast} /></div>}
+                {view === 'actions'   && <div className="h-full overflow-hidden"><PendingActionsView onSelectContact={(p) => { handleSelectContact(p); }} showToast={showToast} /></div>}
+              </>
+            )}
+          </div>
+
+          {/* Contact Detail Panel */}
+          {selectedPhone && (
+            <div className="w-96 bg-gray-900 flex flex-col overflow-hidden shrink-0">
+              <ContactDetail
+                phone={selectedPhone}
+                onClose={() => setSelectedPhone(null)}
+                onUpdate={updateContact}
+                showToast={showToast}
+              />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

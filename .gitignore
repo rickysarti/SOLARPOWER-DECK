@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+node_modules/
+data/
+logs/
+*.db
+*.db-*
+*.log
+*-out.log
+*-err.log
+google-oauth-client.json
+supabase/.temp/
+.supabase/
+coverage/
+dist/

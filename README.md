@@ -10,8 +10,8 @@ Storage y Cron. No requieren un servidor Windows o Node encendido permanentement
 - Todos los recursos propios usan el prefijo `agent_` o `agent-`.
 - Produccion usa SendPulse y el bot se ejecuta enteramente en Supabase.
 - Meta queda implementado como proveedor alternativo para una migracion futura.
-- `energy-analyze` procesa facturas nuevas, guarda el resultado en el CRM y
-  entrega el reporte interno por WhatsApp mediante SendPulse.
+- `energy-analyze` procesa facturas nuevas y guarda el resultado solamente en
+  el analisis energetico del lead dentro del CRM de Supabase.
 - `newapp-cron` monitorea inversores, consolida energia, actualiza UVA,
   descubre plantas y envia el reporte matutino mediante SendPulse.
 
@@ -41,8 +41,8 @@ Storage y Cron. No requieren un servidor Windows o Node encendido permanentement
 Las facturas nuevas insertadas en `crm_lead_files` con `kind = 'invoice'` se
 encolan automaticamente. El cron procesa hasta dos por ejecucion, combina el
 archivo con el historial de WhatsApp y el contacto del CRM, ejecuta triage y
-analisis con Claude, y actualiza los campos `energy_*` del contacto. El reporte
-se envia solamente a `ANALYSIS_REPORT_PHONES`; nunca se envia al prospecto.
+analisis con Claude, y actualiza los campos `energy_*` del contacto. El resultado
+no se envia por SendPulse: queda asociado exclusivamente al lead en Supabase.
 El agente de WhatsApp descarga las imagenes y PDF recibidos, identifica las
 facturas electricas, marca `bill_received`, conserva el archivo en el CRM y lo
 conecta con esta cola sin depender de un proceso Windows en memoria.

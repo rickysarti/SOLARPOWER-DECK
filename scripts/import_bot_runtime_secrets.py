@@ -74,10 +74,6 @@ def main() -> int:
         "ANTHROPIC_API_KEY": first(energy, "ANTHROPIC_API_KEY"),
         "ENERGY_TRIAGE_MODEL": first(energy, "ENERGY_TRIAGE_MODEL", default="claude-haiku-4-5-20251001"),
         "ENERGY_ANALYSIS_MODEL": first(energy, "ENERGY_ANALYSIS_MODEL", default="claude-sonnet-4-5"),
-        "ANALYSIS_REPORT_PHONES": first(newapp, "MORNING_REPORT_PHONES", "RICARDO_PHONE"),
-        "SENDPULSE_API_ID": first(newapp, "SENDPULSE_API_ID"),
-        "SENDPULSE_API_SECRET": first(newapp, "SENDPULSE_API_SECRET"),
-        "SENDPULSE_BOT_ID": first(newapp, "SENDPULSE_BOT_ID"),
     }
     newapp_values = {
         "DEYE_API_URL": first(newapp, "DEYE_API_URL", default="https://us1-developer.deyecloud.com/v1.0"),

@@ -81,7 +81,8 @@ async function isBotEcho(phone: string, content: string | null): Promise<boolean
     .eq("contact_phone", phone).eq("role", "assistant").order("created_at", { ascending: false }).limit(1).maybeSingle();
   if (error) throw error;
   const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
-  return Boolean(data?.content) && normalize(data.content) === normalize(content);
+  const previousContent = typeof data?.content === "string" ? data.content : null;
+  return previousContent !== null && normalize(previousContent) === normalize(content);
 }
 
 async function schedulePhone(phone: string): Promise<void> {

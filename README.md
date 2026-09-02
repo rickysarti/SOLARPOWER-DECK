@@ -43,6 +43,9 @@ encolan automaticamente. El cron procesa hasta dos por ejecucion, combina el
 archivo con el historial de WhatsApp y el contacto del CRM, ejecuta triage y
 analisis con Claude, y actualiza los campos `energy_*` del contacto. El reporte
 se envia solamente a `ANALYSIS_REPORT_PHONES`; nunca se envia al prospecto.
+El agente de WhatsApp descarga las imagenes y PDF recibidos, identifica las
+facturas electricas, marca `bill_received`, conserva el archivo en el CRM y lo
+conecta con esta cola sin depender de un proceso Windows en memoria.
 La migracion no encola facturas historicas para evitar costos o avisos masivos
 inesperados; si se desea, ese lote se puede habilitar por separado.
 

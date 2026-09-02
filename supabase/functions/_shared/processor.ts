@@ -33,11 +33,143 @@ function arrayBufferToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-async function describeAndStoreMedia(event: Record<string, unknown>): Promise<string | null> {
+const INVOICE_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+]);
+
+function mediaMimeType(event: Record<string, unknown>, downloaded: string): string {
+  const declared = String(event.media_mime_type ?? "").split(";")[0].trim().toLowerCase();
+  const received = downloaded.split(";")[0].trim().toLowerCase();
+  if (received && received !== "application/octet-stream") return received;
+  if (declared) return declared;
+  return /\.pdf(?:\s|$)/i.test(String(event.content ?? "")) ? "application/pdf" : received || "application/octet-stream";
+}
+
+function mediaExtension(mimeType: string): string {
+  const extensions: Record<string, string> = {
+    "application/pdf": "pdf",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+  };
+  return extensions[mimeType] ?? mimeType.split("/")[1]?.replace(/[^a-z0-9]/gi, "") ?? "bin";
+}
+
+export function isElectricityInvoiceMedia(
+  event: Record<string, unknown>,
+  mimeType: string,
+  analysis: string | null,
+): boolean {
+  if (!INVOICE_MIME_TYPES.has(mimeType)) return false;
+  const evidence = `${event.content ?? ""}\n${analysis ?? ""}`;
+  if (/\b(cv|curr[ií]culum|resume|hoja de vida)\b/i.test(evidence)) return false;
+  if (/\b(edenor|edesur|edelap|epec|factura\s+(?:de\s+)?(?:luz|electricidad|el[eé]ctrica|energ[ií]a)|boleta\s+(?:de\s+)?(?:luz|electricidad|el[eé]ctrica|energ[ií]a)|servicio\s+el[eé]ctrico|tarifa\s+t[123])\b/i.test(evidence)) {
+    return true;
+  }
+  return String(event.message_type ?? "") === "document" && mimeType === "application/pdf";
+}
+
+function safeFileName(event: Record<string, unknown>, extension: string): string {
+  const content = String(event.content ?? "").trim();
+  const candidate = /\.(?:pdf|jpe?g|png|webp|gif)$/i.test(content)
+    ? content
+    : `factura_${event.id}.${extension}`;
+  return candidate.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 180);
+}
+
+async function registerInvoice(
+  event: Record<string, unknown>,
+  bytes: Uint8Array,
+  mimeType: string,
+  analysis: string | null,
+): Promise<void> {
+  const markedAgent = await db().from("agent_contacts").update({
+    bill_received: true,
+    updated_at: new Date().toISOString(),
+  }).eq("phone", event.phone);
+  if (markedAgent.error) throw markedAgent.error;
+  const markedCrm = await db().from("chatbot_wa_contacts").update({
+    bill_received: true,
+    updated_at: new Date().toISOString(),
+    last_activity_at: new Date().toISOString(),
+  }).eq("phone", event.phone);
+  if (markedCrm.error) throw markedCrm.error;
+
+  const extension = mediaExtension(mimeType);
+  const filename = safeFileName(event, extension);
+  const storagePath = `wa/${event.phone}/${event.id}-${filename}`;
+  const existing = await db().from("crm_lead_files").select("id")
+    .eq("storage_bucket", "crm-lead-files").eq("storage_path", storagePath).limit(1).maybeSingle();
+  if (existing.error) throw existing.error;
+  if (existing.data) return;
+
+  const uploaded = await db().storage.from("crm-lead-files").upload(storagePath, bytes, {
+    contentType: mimeType,
+    upsert: false,
+  });
+  if (uploaded.error && !uploaded.error.message.toLowerCase().includes("already exists")) throw uploaded.error;
+  const publicUrl = db().storage.from("crm-lead-files").getPublicUrl(storagePath).data.publicUrl;
+  const inserted = await db().from("crm_lead_files").insert({
+    source: "wa",
+    contact_phone: event.phone,
+    file_url: publicUrl,
+    file_name: filename,
+    mime_type: mimeType,
+    file_size: bytes.byteLength,
+    kind: "invoice",
+    source_channel: "whatsapp",
+    storage_bucket: "crm-lead-files",
+    storage_path: storagePath,
+    metadata: {
+      source: "agent-supabase",
+      inbound_event_id: event.id,
+      invoice_detection: analysis ?? event.content ?? null,
+    },
+  });
+  if (inserted.error) throw inserted.error;
+}
+
+export async function recoverStoredInvoice(agentFileId: string): Promise<{ linked: boolean; agentFileId: string }> {
+  if (!/^[0-9a-f-]{36}$/i.test(agentFileId)) throw new Error("Invalid agent file id");
+  const stored = await db().from("agent_files")
+    .select("id,contact_phone,inbound_event_id,storage_path,file_name,mime_type,provider_media_id,analysis")
+    .eq("id", agentFileId).maybeSingle();
+  if (stored.error) throw stored.error;
+  if (!stored.data) throw new Error("Agent file not found");
+  const mimeType = String(stored.data.mime_type ?? "application/octet-stream").split(";")[0].toLowerCase();
+  const event = {
+    id: stored.data.inbound_event_id ?? stored.data.id,
+    phone: stored.data.contact_phone,
+    content: stored.data.file_name,
+    message_type: mimeType === "application/pdf" ? "document" : "image",
+    media_id: stored.data.provider_media_id,
+  };
+  if (!isElectricityInvoiceMedia(event, mimeType, stored.data.analysis)) {
+    throw new Error("Stored file is not classified as an electricity invoice");
+  }
+  const downloaded = await db().storage.from("agent-files").download(stored.data.storage_path);
+  if (downloaded.error) throw downloaded.error;
+  await registerInvoice(
+    event,
+    new Uint8Array(await downloaded.data.arrayBuffer()),
+    mimeType,
+    stored.data.analysis,
+  );
+  return { linked: true, agentFileId };
+}
+
+async function describeAndStoreMedia(event: Record<string, unknown>): Promise<{ description: string; invoice: boolean }> {
   const mediaId = String(event.media_id ?? event.media_url ?? "");
-  if (!mediaId) return null;
-  const { bytes, mimeType } = await downloadWhatsAppMedia(event);
-  const extension = mimeType.split("/")[1]?.split(";")[0] ?? "bin";
+  if (!mediaId) return { description: "[Archivo sin identificador de descarga]", invoice: false };
+  const downloaded = await downloadWhatsAppMedia(event);
+  const { bytes } = downloaded;
+  const mimeType = mediaMimeType(event, downloaded.mimeType);
+  const extension = mediaExtension(mimeType);
   const path = `${event.phone}/${event.id}.${extension}`;
   const { error: uploadError } = await db().storage.from("agent-files").upload(path, bytes, {
     contentType: mimeType,
@@ -49,7 +181,7 @@ async function describeAndStoreMedia(event: Record<string, unknown>): Promise<st
   if (mimeType.startsWith("image/")) {
     analysis = await analyzeImage(mimeType, arrayBufferToBase64(bytes));
   }
-  await db().from("agent_files").upsert({
+  const stored = await db().from("agent_files").upsert({
     contact_phone: event.phone,
     inbound_event_id: event.id,
     storage_path: path,
@@ -58,7 +190,10 @@ async function describeAndStoreMedia(event: Record<string, unknown>): Promise<st
     provider_media_id: mediaId,
     analysis,
   }, { onConflict: "storage_path" });
-  return analysis ?? `[Archivo recibido: ${mimeType}]`;
+  if (stored.error) throw stored.error;
+  const invoice = isElectricityInvoiceMedia(event, mimeType, analysis);
+  if (invoice) await registerInvoice(event, bytes, mimeType, analysis);
+  return { description: analysis ?? `[Archivo recibido: ${mimeType}]`, invoice };
 }
 
 async function ensureContact(phone: string, name: string | null) {
@@ -129,12 +264,21 @@ async function processInbound(phone: string): Promise<void> {
   const name = events.map((event) => event.contact_name).find(Boolean) ?? null;
   const contact = await ensureContact(phone, name);
   const parts: string[] = [];
+  let invoiceReceived = false;
   for (const event of events) {
     if (event.content) parts.push(event.content);
     if (event.media_id || event.media_url) {
-      const description = await describeAndStoreMedia(event);
-      if (description) parts.push(description);
+      const media = await describeAndStoreMedia(event);
+      parts.push(media.description);
+      invoiceReceived ||= media.invoice;
     }
+  }
+  if (invoiceReceived && !contact.bill_received) {
+    contact.bill_received = true;
+    const updated = await db().from("agent_contacts").update({ bill_received: true, updated_at: new Date().toISOString() })
+      .eq("phone", phone);
+    if (updated.error) throw updated.error;
+    await syncContactToCrm(contact);
   }
   const incoming = parts.join("\n").trim() || "[Mensaje sin texto]";
 

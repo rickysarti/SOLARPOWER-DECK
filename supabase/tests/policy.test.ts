@@ -3,12 +3,15 @@ import {
   isStandaloneLighting,
   parseAgentDecision,
   replyViolations,
+  requestsHumanRepresentative,
 } from "../functions/_shared/decision.ts";
 import { hasForbiddenFormatting, sanitizePlainText } from "../functions/_shared/output.ts";
 import { agentSystemPrompt } from "../functions/_shared/prompts.ts";
 import {
+  deterministicDecision,
   fallbackContinuation,
   nextRequiredField,
+  repeatsPreviousAssistantReply,
   replyRequestsField,
 } from "../functions/_shared/processor.ts";
 import { splitText } from "../functions/_shared/sendpulse.ts";
@@ -29,6 +32,34 @@ Deno.test("detecta luminarias fuera de alcance y cargadores", () => {
   assertEquals(isStandaloneLighting("Quiero paneles para alimentar luminarias"), false);
   assertEquals(chargerScopeFromText("Quiero solamente un cargador eléctrico"), "solo_cargador");
   assertEquals(chargerScopeFromText("Quiero paneles solares y un wallbox"), "solar_y_cargador");
+});
+
+Deno.test("una solicitud de representante tiene prioridad sobre los datos pendientes", () => {
+  assert(requestsHumanRepresentative("Pero necesito hablar con un representante"));
+  assert(requestsHumanRepresentative("Tenés un número de teléfono así te llamo"));
+  const decision = deterministicDecision(
+    "Pero necesito hablar con un representante",
+    "residencial",
+    false,
+  );
+  assertEquals(decision?.handoff, true);
+  assertEquals(decision?.label, "Solicita representante");
+  assert(!decision?.reply.includes("techo"));
+});
+
+Deno.test("detecta una respuesta exactamente repetida", () => {
+  const reply = "¿Qué tipo de techo o superficie tenés disponible para instalar los paneles?";
+  assert(repeatsPreviousAssistantReply(reply, [
+    { role: "assistant", content: reply.toLocaleUpperCase("es") },
+    { role: "user", content: "Uno de chapa y otro de teja" },
+  ]));
+  assertEquals(
+    repeatsPreviousAssistantReply("¿En qué localidad sería?", [
+      { role: "assistant", content: reply },
+      { role: "user", content: "Uno de chapa y otro de teja" },
+    ]),
+    false,
+  );
 });
 
 Deno.test("valida AgentDecision y rechaza respuestas impropias", () => {

@@ -156,6 +156,15 @@ export function isStandaloneLighting(incoming: string): boolean {
     !/\b(solar|panel(?:es)?|fotovolta(?:ico|ica|icos|icas)?|energ[ií]a solar)\b/i.test(incoming);
 }
 
+export function requestsHumanRepresentative(incoming: string): boolean {
+  return /\b(?:hablar|comunicarme|contactarme|llamar|llamo|llame|atienda|atenderme)\b.{0,45}\b(?:representante|asesor|persona|humano|vendedor)\b/i
+    .test(incoming) ||
+    /\b(?:representante|asesor|persona|humano|vendedor)\b.{0,45}\b(?:hablar|comunicar|contact|llam|atienda|atender)\w*/i
+      .test(incoming) ||
+    /\b(?:ten[eé]s|hay|me pas[aá]s?|pasame)\b.{0,35}\b(?:n[uú]mero|tel[eé]fono)\b.{0,25}\b(?:llam|contact)/i
+      .test(incoming);
+}
+
 export function chargerScopeFromText(incoming: string): AgentFieldUpdates["charger_scope"] | null {
   if (!/\b(cargador|carga).{0,20}\b(el[eé]ctric|veh[ií]culo|auto)|\bwallbox\b/i.test(incoming)) return null;
   if (

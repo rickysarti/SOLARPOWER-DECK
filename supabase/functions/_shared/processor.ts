@@ -3,6 +3,8 @@ import { processAgendaMessage } from "./agenda.ts";
 import {
   contactCategory,
   conversationMissingFields,
+  deferredRequiredField,
+  explicitAgentFields,
   isQuoteEligible,
   safeAgentPatch,
   taskFor,
@@ -18,6 +20,7 @@ import {
   isStandaloneLighting,
   parseAgentDecision,
   replyViolations,
+  requestsHumanRepresentative,
 } from "./decision.ts";
 import { errorMessage } from "./errors.ts";
 import { normalizePhone } from "./meta.ts";
@@ -334,6 +337,19 @@ export function deterministicDecision(
   category: AgentCategory,
   isFirstConversation: boolean,
 ): AgentDecision | null {
+  if (requestsHumanRepresentative(incoming)) {
+    return {
+      reply:
+        "Por supuesto. Ya paso tu consulta a un representante para que continúe personalmente con vos por este mismo número.",
+      classification: category,
+      fields: explicitAgentFields(incoming),
+      missingFields: [],
+      completeForQuote: false,
+      handoff: true,
+      handoffReason: "El cliente pidió hablar con un representante",
+      label: "Solicita representante",
+    };
+  }
   if (isStandaloneLighting(incoming)) {
     return {
       reply:
@@ -383,6 +399,16 @@ export function deterministicDecision(
   return null;
 }
 
+export function repeatsPreviousAssistantReply(reply: string, history: AgentMessage[]): boolean {
+  const previousAssistantReply = [...history].reverse().find((message) => message.role === "assistant")
+    ?.content;
+  return Boolean(
+    previousAssistantReply &&
+      sanitizePlainText(previousAssistantReply).toLocaleLowerCase("es") ===
+        sanitizePlainText(reply).toLocaleLowerCase("es"),
+  );
+}
+
 async function modelDecision(
   contact: ContactPromptData,
   category: AgentCategory,
@@ -397,6 +423,9 @@ async function modelDecision(
       const raw = await askClaude(agentSystemPrompt(contact, category, missing, correction), history, 1200);
       const decision = parseAgentDecision(raw, category);
       const violations = replyViolations(decision.reply, incoming);
+      if (repeatsPreviousAssistantReply(decision.reply, history)) {
+        violations.push("repite exactamente la respuesta anterior");
+      }
       const requiredField = nextRequiredField(missing, decision.fields);
       if (
         requiredField && category !== "cv" && category !== "soporte" && category !== "otro" &&
@@ -658,6 +687,15 @@ async function processInbound(phone: string): Promise<void> {
         category = chargerScope ? "cargador_electrico" : await classifyContact(incoming);
       }
 
+      const missingBeforeExplicitExtraction = conversationMissingFields(category, contact);
+      const explicitFields = explicitAgentFields(incoming, missingBeforeExplicitExtraction[0] ?? null);
+      if (Object.keys(explicitFields).length) {
+        contact = await applyContactState({
+          phone,
+          patch: safeAgentPatch(contact, explicitFields, category, incoming),
+        });
+      }
+
       const historyResult = await db().from("agent_messages")
         .select("role,content").eq("contact_phone", phone).order("created_at", { ascending: false }).limit(
           40,
@@ -668,8 +706,16 @@ async function processInbound(phone: string): Promise<void> {
       ) as AgentMessage[];
       const isFirstConversation = !history.some((row) => row.role === "assistant");
       const initialMissing = conversationMissingFields(category, contact);
+      const deferredField = deferredRequiredField(incoming, initialMissing[0] ?? null);
+      const decisionMissing = deferredField
+        ? initialMissing.filter((field) => field !== deferredField)
+        : initialMissing;
+      const explicitHumanHandoff = requestsHumanRepresentative(incoming);
+      const quoteAlreadyQueued = contact.stage === "pendiente_presupuesto" ||
+        contact.label === "Pendiente enviar presupuesto";
+      const academyAlreadyQueued = contact.label === "Academia Solar" && contact.notified_ricardo === true;
       const decision = deterministicDecision(incoming, category, isFirstConversation) ??
-        await modelDecision(contact, category, initialMissing, history, incoming);
+        await modelDecision(contact, category, decisionMissing, history, incoming);
       category = decision.classification;
       const storedChargerScope = contact.agent_state?.charger_scope;
       const effectiveChargerScope = chargerScope ??
@@ -687,11 +733,24 @@ async function processInbound(phone: string): Promise<void> {
         contact,
         {
           ...decision.fields,
+          ...explicitFields,
           ...(effectiveChargerScope ? { charger_scope: effectiveChargerScope } : {}),
         },
         category,
         incoming,
       );
+      if (deferredField) {
+        const skipped = new Set<string>(
+          Array.isArray(contact.agent_state?.skipped_fields)
+            ? contact.agent_state.skipped_fields.map((field: unknown) => String(field))
+            : [],
+        );
+        skipped.add(deferredField);
+        patch.agent_state = {
+          ...(patch.agent_state as Record<string, unknown>),
+          skipped_fields: [...skipped],
+        };
+      }
       if (decision.label) patch.label = decision.label;
       contact = await applyContactState({ phone, patch });
 
@@ -707,19 +766,31 @@ async function processInbound(phone: string): Promise<void> {
       };
       let taskTitle: string | null = null;
       let taskDescription: string | null = null;
-      if (completeForQuote) {
+      if (explicitHumanHandoff) {
+        statePatch.human_mode = true;
+        statePatch.label = "Solicita representante";
+        statePatch.notified_ricardo = true;
+        taskTitle = "Contactar cliente que pidió un representante";
+        taskDescription = `El cliente pidió continuar con una persona. Motivo: ${
+          decision.handoffReason ?? "solicitud explícita"
+        }`;
+        responseText = decision.reply;
+      } else if (completeForQuote && !quoteAlreadyQueued) {
         statePatch.stage = "pendiente_presupuesto";
         statePatch.label = "Pendiente enviar presupuesto";
         statePatch.notified_ricardo = true;
         ({ title: taskTitle, description: taskDescription } = taskFor(category, true, contact));
         responseText =
           "Perfecto, con esto ya tenemos lo necesario. Voy a pasar la información al equipo de ingeniería para que preparen una propuesta personalizada. En cuanto esté lista te la compartimos.";
-      } else if (academyComplete) {
+      } else if (academyComplete && !academyAlreadyQueued) {
         statePatch.label = "Academia Solar";
         statePatch.notified_ricardo = true;
         ({ title: taskTitle, description: taskDescription } = taskFor(category, false, contact));
         responseText =
           "Perfecto, ya registramos tu interés en la Academia Solar. Te vamos a contactar por email cuando haya novedades.";
+      } else if ((completeForQuote && quoteAlreadyQueued) || (academyComplete && academyAlreadyQueued)) {
+        statePatch.notified_ricardo = true;
+        responseText = decision.reply;
       } else if (needsFollowup) {
         statePatch.notified_ricardo = true;
         if (decision.label) statePatch.label = decision.label;

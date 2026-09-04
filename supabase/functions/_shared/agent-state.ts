@@ -40,7 +40,85 @@ export function quoteMissingFields(contact: Record<string, any>): string[] {
   if (!contact.roof_type && !state.surface) missing.push("techo o superficie");
   if (!contact.connection_type && !state.connection) missing.push("tipo de conexión");
   if (!contact.locality && !contact.province) missing.push("localidad o provincia");
-  return missing;
+  const skipped = new Set(
+    Array.isArray(state.skipped_fields) ? state.skipped_fields.map((field: unknown) => String(field)) : [],
+  );
+  return missing.filter((field) => !skipped.has(field));
+}
+
+function explicitFullName(incoming: string, expectedField: string | null = null): string | null {
+  const tail = incoming.match(/\b(?:me llamo|mi nombre es|soy)\s+([\p{L}'’\- ]{3,100})/iu)?.[1];
+  if (tail) {
+    const stopWords = /^(?:de|y|quiero|quer[ií]a|necesito|busco|consulto|para|porque|por|del|una?|estoy)$/i;
+    const words = tail.match(/[\p{L}][\p{L}'’\-]*/gu) ?? [];
+    const name: string[] = [];
+    for (const word of words) {
+      if (stopWords.test(word)) break;
+      name.push(word);
+      if (name.length === 4) break;
+    }
+    if (name.length >= 2) return name.join(" ");
+  }
+
+  if (expectedField !== "nombre completo") return null;
+  const standalone = incoming.trim().replace(/[.,;:!?]+$/g, "").replace(/\s+/g, " ");
+  return /^[\p{L}][\p{L}'’\-]{1,40}(?:\s+[\p{L}][\p{L}'’\-]{1,40}){1,3}$/u.test(standalone)
+    ? standalone
+    : null;
+}
+
+export function explicitAgentFields(
+  incoming: string,
+  expectedField: string | null = null,
+): AgentFieldUpdates {
+  const fields: AgentFieldUpdates = {};
+  const name = explicitFullName(incoming, expectedField);
+  if (name) fields.name = name;
+
+  const hasChapa = /\bchapa\b/i.test(incoming);
+  const hasTeja = /\btejas?\b/i.test(incoming);
+  if (hasChapa && hasTeja) {
+    fields.roof_type = "Una casa con techo de chapa y otra con techo de tejas";
+  } else if (hasChapa) {
+    fields.roof_type = /\bcom[uú]n\b/i.test(incoming) ? "Techo de chapa común" : "Techo de chapa";
+  } else if (hasTeja) {
+    fields.roof_type = "Techo de tejas";
+  } else if (/\b(?:losa|membrana)\b/i.test(incoming)) {
+    fields.roof_type = /\blosa\b/i.test(incoming) ? "Techo de losa" : "Techo con membrana";
+  } else if (
+    /\b(?:soporte|estructura)\b/i.test(incoming) &&
+    /\b(?:paneles?|pantallas?|orientaci[oó]n|instalar|colocar)\b/i.test(incoming)
+  ) {
+    fields.roof_type = "Estructura independiente a definir según orientación";
+  }
+
+  if (
+    /\b(?:sin\s+(?:conexi[oó]n|acceso)\s+a\s+la\s+red|sin\s+red|off[ -]?grid|fuera\s+de\s+red|no\s+hay\s+red)\b/i
+      .test(incoming)
+  ) {
+    fields.connection_type = "off-grid sin red eléctrica";
+  } else if (/\bmonof[aá]sic[ao]\b/i.test(incoming)) {
+    fields.connection_type = "monofásica";
+  } else if (/\btrif[aá]sic[ao]\b/i.test(incoming)) {
+    fields.connection_type = "trifásica";
+  }
+
+  const loads = incoming.match(
+    /\b(?:heladera|freezer|luces?|focos?|bomba|lavarropas?|televisi[oó]n|televisor|starlink|electrificador|ventilador|celulares?|aires? acondicionado)\b/gi,
+  ) ?? [];
+  if (new Set(loads.map((load) => load.toLowerCase())).size >= 2) {
+    fields.consumption_evidence = "lista de equipos proporcionada";
+  }
+  return fields;
+}
+
+export function deferredRequiredField(incoming: string, currentField: string | null): string | null {
+  if (!currentField) return null;
+  return /\b(?:despu[eé]s\s+(?:vemos|lo vemos|se ve)|m[aá]s adelante|pasame|p[aá]same|mandame|m[aá]ndame)\b.{0,80}\b(?:presupuesto|cotizaci[oó]n|vemos|definimos|colocar|instalar)\b/i
+      .test(incoming) ||
+      /\b(?:no importa|no hay problema|donde tenga que ser|por recomendaci[oó]n)\b/i.test(incoming)
+    ? currentField
+    : null;
 }
 
 function hasFullName(value: unknown): boolean {
@@ -57,7 +135,11 @@ export function conversationMissingFields(
     if (!hasFullName(contact.name)) missing.push("nombre completo");
     if (!contact.email) missing.push("email");
     if (!contact.locality && !contact.province) missing.push("localidad o provincia");
-    return missing;
+    const state = stateOf(contact);
+    const skipped = new Set(
+      Array.isArray(state.skipped_fields) ? state.skipped_fields.map((field: unknown) => String(field)) : [],
+    );
+    return missing.filter((field) => !skipped.has(field));
   }
   return quoteMissingFields(contact);
 }
@@ -88,6 +170,14 @@ export function safeAgentPatch(
     }
     const current = contact[key];
     if (key === "name" && !/\p{L}/u.test(String(current ?? ""))) {
+      patch[key] = fields[key];
+      nextExtracted[key] = fields[key];
+      continue;
+    }
+    if (
+      key === "name" && hasFullName(fields[key]) && !hasFullName(current) &&
+      explicitFullName(evidence, "nombre completo") === fields[key]
+    ) {
       patch[key] = fields[key];
       nextExtracted[key] = fields[key];
       continue;

@@ -1,5 +1,7 @@
 import {
   conversationMissingFields,
+  deferredRequiredField,
+  explicitAgentFields,
   isQuoteEligible,
   quoteMissingFields,
   safeAgentPatch,
@@ -86,4 +88,61 @@ Deno.test("no guarda una conexión inventada por el modelo", () => {
     "Quiero un sistema on-grid de 5 kW en La Plata",
   );
   assertEquals(patch.connection_type, undefined);
+});
+
+Deno.test("extrae dos techos aunque el cliente no repita la palabra techo", () => {
+  assertEquals(explicitAgentFields("Uno de chapa y otro de teja"), {
+    roof_type: "Una casa con techo de chapa y otra con techo de tejas",
+  });
+  assertEquals(
+    explicitAgentFields("Por la orientación del techo conviene hacer soporte para las pantallas"),
+    { roof_type: "Estructura independiente a definir según orientación" },
+  );
+});
+
+Deno.test("extrae nombre completo, off-grid y lista de cargas sin depender del modelo", () => {
+  assertEquals(
+    explicitAgentFields(
+      "Soy Raul Maizterrena y quería dos kits sin conexión a la red para heladera, luces y bomba",
+    ),
+    {
+      name: "Raul Maizterrena",
+      connection_type: "off-grid sin red eléctrica",
+      consumption_evidence: "lista de equipos proporcionada",
+    },
+  );
+});
+
+Deno.test("acepta un nombre completo escrito como respuesta directa", () => {
+  assertEquals(explicitAgentFields("Tobias Fernando Bordón", "nombre completo"), {
+    name: "Tobias Fernando Bordón",
+  });
+  assertEquals(explicitAgentFields("Buenos Aires", "localidad o provincia"), {});
+  const patch = safeAgentPatch(
+    { name: "Tobias", agent_state: {} },
+    { name: "Tobias Fernando Bordón" },
+    "academia",
+    "Tobias Fernando Bordón",
+  );
+  assertEquals(patch.name, "Tobias Fernando Bordón");
+});
+
+Deno.test("no vuelve a exigir un dato que el cliente decidió definir después", () => {
+  const field = deferredRequiredField(
+    "Pasame presupuesto y después vemos cómo colocar los paneles",
+    "techo o superficie",
+  );
+  assertEquals(field, "techo o superficie");
+  assertEquals(
+    conversationMissingFields("residencial", {
+      product_interest: "off-grid",
+      connection_type: "off-grid sin red eléctrica",
+      locality: "San Juan",
+      agent_state: {
+        consumption_evidence: "lista de equipos proporcionada",
+        skipped_fields: [field],
+      },
+    }),
+    [],
+  );
 });

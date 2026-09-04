@@ -32,13 +32,18 @@ export async function runtimeSecret(name: string): Promise<string | null> {
   const environmentValue = Deno.env.get(name);
   if (environmentValue) return environmentValue;
   if (!secretCache.has(name)) {
-    secretCache.set(name, (async () => {
-      const { data, error } = await db().rpc("agent_get_runtime_secret", { p_name: name });
-      if (error) throw error;
-      return typeof data === "string" && data ? data : null;
-    })());
+    secretCache.set(
+      name,
+      (async () => {
+        const { data, error } = await db().rpc("agent_get_runtime_secret", { p_name: name });
+        if (error) throw error;
+        return typeof data === "string" && data ? data : null;
+      })(),
+    );
   }
-  return await secretCache.get(name)!;
+  const value = await secretCache.get(name)!;
+  if (!value) secretCache.delete(name);
+  return value;
 }
 
 export async function setting(key: string): Promise<string | null> {

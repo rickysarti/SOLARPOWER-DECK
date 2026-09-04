@@ -1,10 +1,35 @@
-import { analyzeImage, askClaude, classifyContact, type AgentMessage } from "./anthropic.ts";
+import { type AgentMessage, classifyContact, classifyMedia, type MediaClassification } from "./anthropic.ts";
 import { processAgendaMessage } from "./agenda.ts";
+import {
+  contactCategory,
+  conversationMissingFields,
+  isQuoteEligible,
+  safeAgentPatch,
+  taskFor,
+} from "./agent-state.ts";
+import { authorizedControlCommand, type ControlCommand } from "./control.ts";
+import { applyContactState, ensureCrmContact, syncMessageToCrm } from "./crm-compat.ts";
+import { maybeSendDailyReport } from "./daily-report.ts";
 import { db, runtimeSecret, setting } from "./db.ts";
+import {
+  type AgentCategory,
+  type AgentDecision,
+  chargerScopeFromText,
+  isStandaloneLighting,
+  parseAgentDecision,
+  replyViolations,
+} from "./decision.ts";
+import { errorMessage } from "./errors.ts";
 import { normalizePhone } from "./meta.ts";
-import { downloadWhatsAppMedia, sendWhatsAppText } from "./whatsapp.ts";
-import { agentSystemPrompt, notificationPrompt } from "./prompts.ts";
-import { readCrmContact, syncActionToCrm, syncContactToCrm, syncMessageToCrm } from "./crm-compat.ts";
+import { sanitizePlainText } from "./output.ts";
+import { agentSystemPrompt, type ContactPromptData } from "./prompts.ts";
+import {
+  downloadWhatsAppMedia,
+  preparedWhatsAppText,
+  retryDueOutboundMessages,
+  sendWhatsAppText,
+} from "./whatsapp.ts";
+import { askClaude } from "./anthropic.ts";
 
 type Job = {
   id: string;
@@ -13,27 +38,27 @@ type Job = {
   attempts: number;
 };
 
-function cleanResponse(raw: string): string {
-  return raw.replace(/##(?:ETIQUETAR:[^#]+|NOTIFICAR_RICARDO|DERIVAR_HUMANO)##/gi, "").trim();
-}
+type StoredMedia = { description: string; invoice: boolean; kind: string; confidence: string };
 
-function marker(raw: string, name: string): boolean {
-  return raw.toUpperCase().includes(`##${name.toUpperCase()}##`);
-}
+class InboundProcessingError extends Error {
+  eventIds: string[];
 
-function extractLabel(raw: string): string | null {
-  return raw.match(/##ETIQUETAR:([^#]+)##/i)?.[1]?.trim() ?? null;
+  constructor(cause: unknown, eventIds: string[]) {
+    super(errorMessage(cause));
+    this.name = "InboundProcessingError";
+    this.eventIds = eventIds;
+  }
 }
 
 function arrayBufferToBase64(bytes: Uint8Array): string {
   let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
   }
   return btoa(binary);
 }
 
-const INVOICE_MIME_TYPES = new Set([
+const SUPPORTED_MEDIA = new Set([
   "application/pdf",
   "image/jpeg",
   "image/png",
@@ -46,7 +71,9 @@ function mediaMimeType(event: Record<string, unknown>, downloaded: string): stri
   const received = downloaded.split(";")[0].trim().toLowerCase();
   if (received && received !== "application/octet-stream") return received;
   if (declared) return declared;
-  return /\.pdf(?:\s|$)/i.test(String(event.content ?? "")) ? "application/pdf" : received || "application/octet-stream";
+  return /\.pdf(?:\s|$)/i.test(String(event.content ?? ""))
+    ? "application/pdf"
+    : received || "application/octet-stream";
 }
 
 function mediaExtension(mimeType: string): string {
@@ -60,60 +87,73 @@ function mediaExtension(mimeType: string): string {
   return extensions[mimeType] ?? mimeType.split("/")[1]?.replace(/[^a-z0-9]/gi, "") ?? "bin";
 }
 
-export function isElectricityInvoiceMedia(
-  event: Record<string, unknown>,
-  mimeType: string,
-  analysis: string | null,
-): boolean {
-  if (!INVOICE_MIME_TYPES.has(mimeType)) return false;
-  const evidence = `${event.content ?? ""}\n${analysis ?? ""}`;
-  if (/\b(cv|curr[ií]culum|resume|hoja de vida)\b/i.test(evidence)) return false;
-  if (/\b(edenor|edesur|edelap|epec|factura\s+(?:de\s+)?(?:luz|electricidad|el[eé]ctrica|energ[ií]a)|boleta\s+(?:de\s+)?(?:luz|electricidad|el[eé]ctrica|energ[ií]a)|servicio\s+el[eé]ctrico|tarifa\s+t[123])\b/i.test(evidence)) {
-    return true;
-  }
-  return String(event.message_type ?? "") === "document" && mimeType === "application/pdf";
-}
-
 function safeFileName(event: Record<string, unknown>, extension: string): string {
   const content = String(event.content ?? "").trim();
   const candidate = /\.(?:pdf|jpe?g|png|webp|gif)$/i.test(content)
     ? content
-    : `factura_${event.id}.${extension}`;
+    : `archivo_${event.id}.${extension}`;
   return candidate.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 180);
 }
 
-async function registerInvoice(
+function fallbackMediaClassification(event: Record<string, unknown>): MediaClassification {
+  const text = String(event.content ?? "");
+  const invoiceEvidence =
+    /\b(edenor|edesur|edelap|epec|epe|medidor|tarifa|kwh|factura\s+(?:de\s+)?(?:luz|electricidad|energ[ií]a)|boleta\s+(?:de\s+)?luz)\b/i
+      .test(text);
+  const cvEvidence = /\b(cv|curr[ií]culum|resume|hoja de vida)\b/i.test(text);
+  const catalogEvidence = /\b(cat[aá]logo|lista de precios|ficha t[eé]cnica|productos)\b/i.test(text);
+  return {
+    kind: invoiceEvidence ? "invoice" : cvEvidence ? "cv" : catalogEvidence ? "catalog" : "other",
+    confidence: invoiceEvidence || cvEvidence || catalogEvidence ? "medium" : "low",
+    description: text || "Archivo recibido",
+    evidence: invoiceEvidence || cvEvidence || catalogEvidence ? text.slice(0, 300) : "",
+  };
+}
+
+export function isElectricityInvoiceMedia(
+  event: Record<string, unknown>,
+  mimeType: string,
+  classification: MediaClassification | string | null,
+): boolean {
+  if (!SUPPORTED_MEDIA.has(mimeType)) return false;
+  let parsed: MediaClassification | null = null;
+  if (classification && typeof classification === "object") parsed = classification;
+  if (typeof classification === "string") {
+    try {
+      parsed = JSON.parse(classification) as MediaClassification;
+    } catch {
+      parsed = null;
+    }
+  }
+  if (!parsed || parsed.kind !== "invoice" || !["high", "medium"].includes(parsed.confidence)) return false;
+  const evidence = `${event.content ?? ""}\n${parsed.evidence ?? ""}\n${parsed.description ?? ""}`;
+  return /\b(edenor|edesur|edelap|eden|edes|edea|epec|epe|cooperativa|medidor|tarifa|kwh|consumo|factura|boleta|servicio el[eé]ctrico)\b/i
+    .test(evidence);
+}
+
+async function registerCrmFile(
   event: Record<string, unknown>,
   bytes: Uint8Array,
   mimeType: string,
-  analysis: string | null,
-): Promise<void> {
-  const markedAgent = await db().from("agent_contacts").update({
-    bill_received: true,
-    updated_at: new Date().toISOString(),
-  }).eq("phone", event.phone);
-  if (markedAgent.error) throw markedAgent.error;
-  const markedCrm = await db().from("chatbot_wa_contacts").update({
-    bill_received: true,
-    updated_at: new Date().toISOString(),
-    last_activity_at: new Date().toISOString(),
-  }).eq("phone", event.phone);
-  if (markedCrm.error) throw markedCrm.error;
-
+  classification: MediaClassification,
+): Promise<boolean> {
   const extension = mediaExtension(mimeType);
   const filename = safeFileName(event, extension);
   const storagePath = `wa/${event.phone}/${event.id}-${filename}`;
-  const existing = await db().from("crm_lead_files").select("id")
+  const existing = await db().from("crm_lead_files").select("id,kind")
     .eq("storage_bucket", "crm-lead-files").eq("storage_path", storagePath).limit(1).maybeSingle();
   if (existing.error) throw existing.error;
-  if (existing.data) return;
+  if (existing.data) return existing.data.kind === "invoice";
 
   const uploaded = await db().storage.from("crm-lead-files").upload(storagePath, bytes, {
     contentType: mimeType,
     upsert: false,
   });
-  if (uploaded.error && !uploaded.error.message.toLowerCase().includes("already exists")) throw uploaded.error;
+  if (uploaded.error && !uploaded.error.message.toLowerCase().includes("already exists")) {
+    throw uploaded.error;
+  }
   const publicUrl = db().storage.from("crm-lead-files").getPublicUrl(storagePath).data.publicUrl;
+  const invoice = isElectricityInvoiceMedia(event, mimeType, classification);
   const inserted = await db().from("crm_lead_files").insert({
     source: "wa",
     contact_phone: event.phone,
@@ -121,20 +161,30 @@ async function registerInvoice(
     file_name: filename,
     mime_type: mimeType,
     file_size: bytes.byteLength,
-    kind: "invoice",
+    kind: invoice ? "invoice" : classification.kind === "cv" ? "cv" : "document",
     source_channel: "whatsapp",
     storage_bucket: "crm-lead-files",
     storage_path: storagePath,
     metadata: {
-      source: "agent-supabase",
+      source: "agent-supabase-v2",
       inbound_event_id: event.id,
-      invoice_detection: analysis ?? event.content ?? null,
+      media_classification: classification,
+      needs_review: !invoice && classification.confidence === "low",
     },
   });
   if (inserted.error) throw inserted.error;
+  if (invoice) {
+    await applyContactState({
+      phone: String(event.phone),
+      patch: { bill_received: true, agent_state: { consumption_evidence: "Factura eléctrica recibida" } },
+    });
+  }
+  return invoice;
 }
 
-export async function recoverStoredInvoice(agentFileId: string): Promise<{ linked: boolean; agentFileId: string }> {
+export async function recoverStoredInvoice(
+  agentFileId: string,
+): Promise<{ linked: boolean; agentFileId: string }> {
   if (!/^[0-9a-f-]{36}$/i.test(agentFileId)) throw new Error("Invalid agent file id");
   const stored = await db().from("agent_files")
     .select("id,contact_phone,inbound_event_id,storage_path,file_name,mime_type,provider_media_id,analysis")
@@ -149,304 +199,702 @@ export async function recoverStoredInvoice(agentFileId: string): Promise<{ linke
     message_type: mimeType === "application/pdf" ? "document" : "image",
     media_id: stored.data.provider_media_id,
   };
-  if (!isElectricityInvoiceMedia(event, mimeType, stored.data.analysis)) {
+  let classification: MediaClassification | null = null;
+  try {
+    classification = JSON.parse(String(stored.data.analysis ?? ""));
+  } catch {
+    classification = null;
+  }
+  if (!isElectricityInvoiceMedia(event, mimeType, classification)) {
     throw new Error("Stored file is not classified as an electricity invoice");
   }
   const downloaded = await db().storage.from("agent-files").download(stored.data.storage_path);
   if (downloaded.error) throw downloaded.error;
-  await registerInvoice(
+  await registerCrmFile(
     event,
     new Uint8Array(await downloaded.data.arrayBuffer()),
     mimeType,
-    stored.data.analysis,
+    classification!,
   );
   return { linked: true, agentFileId };
 }
 
-async function describeAndStoreMedia(event: Record<string, unknown>): Promise<{ description: string; invoice: boolean }> {
+async function describeAndStoreMedia(event: Record<string, unknown>): Promise<StoredMedia> {
   const mediaId = String(event.media_id ?? event.media_url ?? "");
-  if (!mediaId) return { description: "[Archivo sin identificador de descarga]", invoice: false };
+  if (!mediaId) {
+    return {
+      description: "[Archivo sin identificador de descarga]",
+      invoice: false,
+      kind: "other",
+      confidence: "low",
+    };
+  }
   const downloaded = await downloadWhatsAppMedia(event);
   const { bytes } = downloaded;
   const mimeType = mediaMimeType(event, downloaded.mimeType);
   const extension = mediaExtension(mimeType);
   const path = `${event.phone}/${event.id}.${extension}`;
-  const { error: uploadError } = await db().storage.from("agent-files").upload(path, bytes, {
+  const uploaded = await db().storage.from("agent-files").upload(path, bytes, {
     contentType: mimeType,
     upsert: false,
   });
-  if (uploadError && !uploadError.message.toLowerCase().includes("already exists")) throw uploadError;
+  if (uploaded.error && !uploaded.error.message.toLowerCase().includes("already exists")) {
+    throw uploaded.error;
+  }
 
-  let analysis: string | null = null;
-  if (mimeType.startsWith("image/")) {
-    analysis = await analyzeImage(mimeType, arrayBufferToBase64(bytes));
+  let classification = fallbackMediaClassification(event);
+  if (SUPPORTED_MEDIA.has(mimeType)) {
+    try {
+      classification = await classifyMedia(
+        mimeType,
+        arrayBufferToBase64(bytes),
+        safeFileName(event, extension),
+      );
+    } catch (error) {
+      console.error("media classification fallback", errorMessage(error));
+    }
   }
   const stored = await db().from("agent_files").upsert({
     contact_phone: event.phone,
     inbound_event_id: event.id,
     storage_path: path,
-    file_name: `${event.id}.${extension}`,
+    file_name: safeFileName(event, extension),
     mime_type: mimeType,
     provider_media_id: mediaId,
-    analysis,
+    analysis: JSON.stringify(classification),
   }, { onConflict: "storage_path" });
   if (stored.error) throw stored.error;
-  const invoice = isElectricityInvoiceMedia(event, mimeType, analysis);
-  if (invoice) await registerInvoice(event, bytes, mimeType, analysis);
-  return { description: analysis ?? `[Archivo recibido: ${mimeType}]`, invoice };
-}
-
-async function ensureContact(phone: string, name: string | null) {
-  const crmContact = await readCrmContact(phone);
-  const { data: existing, error } = await db().from("agent_contacts").select("*").eq("phone", phone).maybeSingle();
-  if (error) throw error;
-  if (existing) {
-    const updates: Record<string, unknown> = { last_contact: new Date().toISOString() };
-    if (name && !existing.name) updates.name = name;
-    if (crmContact) {
-      for (const key of ["name", "email", "label", "stage", "tipo", "bill_received", "roof_type", "connection_type", "locality", "product_interest", "notes", "notified_ricardo", "human_mode"]) {
-        if (crmContact[key] !== undefined && crmContact[key] !== null) updates[key] = crmContact[key];
-      }
-    }
-    const { data, error: updateError } = await db().from("agent_contacts").update(updates).eq("phone", phone).select("*").single();
-    if (updateError) throw updateError;
-    await syncContactToCrm(data);
-    return data;
-  }
-  const { data, error: insertError } = await db().from("agent_contacts")
-    .insert({ ...(crmContact ?? {}), phone, name: crmContact?.name || name }).select("*").single();
-  if (insertError) throw insertError;
-  await syncContactToCrm(data);
-  return data;
-}
-
-async function notifyRicardo(contact: Record<string, unknown>, history: AgentMessage[]): Promise<void> {
-  const ricardo = normalizePhone(await runtimeSecret("AGENT_RICARDO_PHONE") ?? "");
-  if (!ricardo) return;
-  const transcript = history.map((message) => `${message.role}: ${message.content}`).join("\n");
-  const alert = await askClaude(
-    "Redacta notificaciones internas breves y concretas para SolarPower.",
-    [{
-      role: "user",
-      content: notificationPrompt(String(contact.name ?? "") || null, String(contact.phone), transcript),
-    }],
-    350,
-  );
-  try {
-    await sendWhatsAppText(ricardo, alert);
-  } catch (error) {
-    await db().from("agent_pending_notifications").insert({
-      phone: ricardo,
-      message: alert,
-      last_error: error instanceof Error ? error.message : String(error),
-    });
-  }
-  const action = {
-    contact_phone: contact.phone,
-    contact_name: contact.name ?? null,
-    action_type: "call",
-    description: alert,
+  const invoice = SUPPORTED_MEDIA.has(mimeType)
+    ? await registerCrmFile(event, bytes, mimeType, classification)
+    : false;
+  return {
+    description: invoice
+      ? "[Factura eléctrica recibida]"
+      : `[Archivo recibido: ${classification.description}]`,
+    invoice,
+    kind: classification.kind,
+    confidence: classification.confidence,
   };
-  await db().from("agent_pending_actions").insert({
-    contact_phone: action.contact_phone,
-    action_type: action.action_type,
-    description: action.description,
-  });
-  await syncActionToCrm(action);
+}
+
+async function internalPhoneSet(): Promise<Set<string>> {
+  const values = await Promise.all([
+    runtimeSecret("AGENT_RICARDO_PHONE"),
+    runtimeSecret("AGENT_AGENDA_PHONE"),
+    runtimeSecret("AGENT_GUILLERMO_PHONE"),
+    runtimeSecret("AGENT_INTERNAL_PHONES"),
+  ]);
+  return new Set(
+    values.flatMap((value) => String(value ?? "").split(/[;,\s]+/))
+      .map((value) => normalizePhone(value))
+      .filter(Boolean),
+  );
+}
+
+async function executeControlCommand(command: ControlCommand): Promise<string> {
+  if (command.type === "status") {
+    return (await setting("bot_enabled")) === "true"
+      ? "Bot activo. Tomás está respondiendo automáticamente."
+      : "Bot pausado globalmente. Ningún cliente recibe respuestas automáticas.";
+  }
+  if (command.type === "global_mode") {
+    const updated = await db().from("agent_settings").update({
+      value: command.enabled ? "true" : "false",
+      updated_at: new Date().toISOString(),
+    }).eq("key", "bot_enabled");
+    if (updated.error) throw updated.error;
+    return command.enabled
+      ? "Bot reactivado. Tomás vuelve a responder automáticamente."
+      : "Bot pausado globalmente. Ningún cliente recibirá respuestas automáticas.";
+  }
+  await applyContactState({ phone: command.phone, patch: { human_mode: command.humanMode } });
+  return command.humanMode
+    ? `Contacto ${command.phone} agregado y puesto en modo humano.`
+    : `Bot reactivado para el contacto ${command.phone}.`;
+}
+
+async function markEvents(
+  ids: string[],
+  disposition: string,
+  processingError: string | null = null,
+  processed = true,
+): Promise<void> {
+  const update = await db().from("agent_inbound_events").update({
+    processed_at: processed ? new Date().toISOString() : null,
+    disposition,
+    disposition_at: new Date().toISOString(),
+    processing_error: processingError,
+  }).in("id", ids);
+  if (update.error) throw update.error;
+}
+
+export function deterministicDecision(
+  incoming: string,
+  category: AgentCategory,
+  isFirstConversation: boolean,
+): AgentDecision | null {
+  if (isStandaloneLighting(incoming)) {
+    return {
+      reply:
+        "SolarPower no vende ni instala luminarias. Si lo que buscás es un sistema solar para alimentar iluminación, podemos ayudarte con ese proyecto.",
+      classification: "otro",
+      fields: {},
+      missingFields: [],
+      completeForQuote: false,
+      handoff: false,
+      handoffReason: null,
+      label: "Fuera de alcance",
+    };
+  }
+  const chargerScope = chargerScopeFromText(incoming);
+  if (chargerScope === "solo_cargador") {
+    return {
+      reply: "Para un cargador sin sistema solar, voy a pasarle tu contacto a un instalador especializado.",
+      classification: "cargador_electrico",
+      fields: { charger_scope: chargerScope, product_interest: "Cargador eléctrico sin sistema solar" },
+      missingFields: [],
+      completeForQuote: false,
+      handoff: true,
+      handoffReason: "Derivar a instalador de cargadores",
+      label: "Derivación cargador eléctrico",
+    };
+  }
+  if (chargerScope === "solar_y_cargador") {
+    return null;
+  }
+  if (
+    isFirstConversation &&
+    /^\s*(hola|buenas|buen d[ií]a|buenas tardes|buenas noches|hol[aá])\s*[.!]?\s*$/i.test(incoming) &&
+    category === "residencial"
+  ) {
+    return {
+      reply:
+        "Hola, soy Tomás de SolarPower. Gracias por escribirnos. ¿Hace cuánto venís pensando en instalar energía solar?",
+      classification: "residencial",
+      fields: {},
+      missingFields: [],
+      completeForQuote: false,
+      handoff: false,
+      handoffReason: null,
+      label: null,
+    };
+  }
+  return null;
+}
+
+async function modelDecision(
+  contact: ContactPromptData,
+  category: AgentCategory,
+  missing: string[],
+  history: AgentMessage[],
+  incoming: string,
+): Promise<AgentDecision> {
+  let correction: string | undefined;
+  let lastError = "";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const raw = await askClaude(agentSystemPrompt(contact, category, missing, correction), history, 1200);
+      const decision = parseAgentDecision(raw, category);
+      const violations = replyViolations(decision.reply, incoming);
+      const requiredField = nextRequiredField(missing, decision.fields);
+      if (
+        requiredField && category !== "cv" && category !== "soporte" && category !== "otro" &&
+        !(category === "cargador_electrico" &&
+          (chargerScopeFromText(incoming) ?? contact.agent_state?.charger_scope) === "solo_cargador") &&
+        !replyRequestsField(decision.reply, requiredField)
+      ) {
+        violations.push(`no pregunta por el próximo dato obligatorio: ${requiredField}`);
+      }
+      if (violations.length) {
+        correction = violations.join("; ");
+        lastError = correction;
+        continue;
+      }
+      return decision;
+    } catch (error) {
+      lastError = errorMessage(error);
+      correction = `La salida no fue JSON válido o incumplió el contrato. Corregila. Motivo: ${lastError}`;
+    }
+  }
+  console.error("agent model response rejected; using deterministic continuation", lastError);
+  return fallbackContinuation(contact, category, missing, incoming);
+}
+
+function fieldResolved(field: string, fields: AgentDecision["fields"]): boolean {
+  switch (field) {
+    case "nombre completo":
+      return String(fields.name ?? "").trim().split(/\s+/).length >= 2;
+    case "email":
+      return Boolean(fields.email);
+    case "localidad o provincia":
+      return Boolean(fields.locality || fields.province);
+    case "factura, consumo o lista de cargas":
+      return Boolean(
+        fields.bill_received || fields.consumo_mensual || fields.consumo_anual || fields.consumption_evidence,
+      );
+    case "techo o superficie":
+      return Boolean(fields.roof_type);
+    case "tipo de conexión":
+      return Boolean(fields.connection_type);
+    case "necesidad o producto":
+      return Boolean(fields.product_interest);
+    default:
+      return false;
+  }
+}
+
+export function nextRequiredField(
+  missing: string[],
+  fields: AgentDecision["fields"],
+): string | null {
+  return missing.find((field) => !fieldResolved(field, fields)) ?? null;
+}
+
+export function replyRequestsField(reply: string, field: string): boolean {
+  const patterns: Record<string, RegExp> = {
+    "nombre completo": /\b(nombre completo|nombre y apellido|c[oó]mo te llam)/i,
+    email: /\b(email|correo electr[oó]nico)\b/i,
+    "localidad o provincia": /\b(localidad|provincia|d[oó]nde (?:ser[ií]a|est[aá]|viv[ií]s|se instalar))/i,
+    "factura, consumo o lista de cargas": /\b(factura|consumo|kwh|kilowatt|monto|equipos|cargas)\b/i,
+    "techo o superficie": /\b(techo|superficie|lugar.{0,25}paneles|paneles.{0,25}instalar)/i,
+    "tipo de conexión": /\b(conexi[oó]n|monof[aá]sic|trif[aá]sic|sin red|off[ -]?grid)\b/i,
+    "necesidad o producto":
+      /\b(ahorro|cortes?|respaldo|independencia|objetivo|motiv|qu[eé] (?:busc[aá]s|quer[eé]s lograr))/i,
+  };
+  return (patterns[field]?.test(reply) ?? true) && reply.includes("?");
+}
+
+function explicitFallbackFields(incoming: string): AgentDecision["fields"] {
+  const fields: AgentDecision["fields"] = {};
+  const annual = incoming.match(/\b([0-9][0-9.,]*)\s*kwh\s*(?:\/|por\s+)?\s*(?:a[nñ]o|anual(?:es)?)\b/i);
+  const monthly = incoming.match(/\b([0-9][0-9.,]*)\s*kwh\s*(?:\/|por\s+)?\s*mes\b/i);
+  const parseNumber = (value: string) => Number(value.replace(/\./g, "").replace(",", "."));
+  if (annual) {
+    const value = parseNumber(annual[1]);
+    if (Number.isFinite(value) && value > 0) fields.consumo_anual = value;
+  }
+  if (monthly) {
+    const value = parseNumber(monthly[1]);
+    if (Number.isFinite(value) && value > 0) fields.consumo_mensual = value;
+  }
+  const name = incoming.match(
+    /\b(?:me llamo|mi nombre es)\s+([\p{L}][\p{L}'’-]{1,40}(?:\s+[\p{L}][\p{L}'’-]{1,40}){0,3})/iu,
+  )?.[1];
+  if (name) fields.name = name.trim();
+  return fields;
+}
+
+export function fallbackContinuation(
+  contact: ContactPromptData,
+  category: AgentCategory,
+  missing: string[],
+  incoming: string,
+): AgentDecision {
+  const fields = explicitFallbackFields(incoming);
+  const resolved = new Set<string>();
+  if (fields.consumo_anual || fields.consumo_mensual) resolved.add("factura, consumo o lista de cargas");
+  if (fields.name && String(fields.name).trim().split(/\s+/).length >= 2) resolved.add("nombre completo");
+  const next = missing.find((field) => !resolved.has(field));
+  let reply: string;
+  if (/\bbater[ií]a\b/i.test(incoming) && /\b(cuotas?|financiaci[oó]n|financiar)\b/i.test(incoming)) {
+    reply =
+      "Las opciones de pago dependen de cada propuesta. ¿Ya tenés un sistema solar instalado o buscás uno completo con paneles y batería?";
+  } else if (category === "academia") {
+    if (next === "nombre completo") {
+      reply =
+        "Perfecto, te interesa capacitarte como instalador. ¿Me decís tu nombre completo para registrar la consulta?";
+    } else if (next === "email") {
+      reply =
+        "Perfecto, ya registré tu nombre. ¿Cuál es tu email para avisarte cuando haya novedades de la Academia Solar?";
+    } else if (next === "localidad o provincia") reply = "Gracias. ¿De qué localidad sos?";
+    else {
+      reply =
+        "Perfecto, ya quedó registrado tu interés en la Academia Solar. Te vamos a contactar por email cuando haya novedades.";
+    }
+  } else if (category === "cv") {
+    reply = "Gracias por tu interés en sumarte a SolarPower. ¿Podés enviar tu CV a info@solarpower.com.ar?";
+  } else if (category === "soporte") {
+    reply = "Entiendo. ¿Qué equipo o parte de la instalación está presentando el problema?";
+  } else if (category === "cargador_electrico") {
+    reply = "¿Buscás el cargador junto con un sistema solar o únicamente el cargador?";
+  } else if (next === "necesidad o producto") {
+    reply =
+      "Para orientarte bien, ¿buscás principalmente ahorro, respaldo ante cortes o independencia total de la red?";
+  } else if (next === "factura, consumo o lista de cargas") {
+    const ambiguous = incoming.match(/\bpromedio\s+anual\s+([0-9][0-9.,]*)\b/i)?.[1];
+    reply = ambiguous
+      ? `¿Esos ${ambiguous} corresponden al promedio mensual en kWh?`
+      : "¿Tenés una factura reciente o el consumo mensual aproximado en kWh?";
+  } else if (next === "techo o superficie") {
+    reply = "¿Qué tipo de techo o superficie tenés disponible para instalar los paneles?";
+  } else if (next === "tipo de conexión") {
+    reply = "¿La conexión eléctrica es monofásica, trifásica o no tenés red?";
+  } else if (next === "localidad o provincia") {
+    reply = "¿En qué localidad y provincia sería la instalación?";
+  } else {
+    reply =
+      "Perfecto, con esto ya tenemos los datos principales. El equipo va a preparar una propuesta personalizada.";
+  }
+  return {
+    reply,
+    classification: category,
+    fields,
+    missingFields: missing,
+    completeForQuote: false,
+    handoff: false,
+    handoffReason: null,
+    label: null,
+  };
 }
 
 async function processInbound(phone: string): Promise<void> {
-  const { data: events, error } = await db().from("agent_inbound_events")
+  const eventsResult = await db().from("agent_inbound_events")
     .select("*").eq("phone", phone).is("processed_at", null).order("received_at").limit(20);
-  if (error) throw error;
-  if (!events?.length) return;
-
-  const name = events.map((event) => event.contact_name).find(Boolean) ?? null;
-  const contact = await ensureContact(phone, name);
-  const parts: string[] = [];
-  let invoiceReceived = false;
-  for (const event of events) {
-    if (event.content) parts.push(event.content);
-    if (event.media_id || event.media_url) {
-      const media = await describeAndStoreMedia(event);
-      parts.push(media.description);
-      invoiceReceived ||= media.invoice;
+  if (eventsResult.error) throw eventsResult.error;
+  let events = eventsResult.data ?? [];
+  if (!events.length) return;
+  const allIds = events.map((event) => event.id);
+  try {
+    const admins = await internalPhoneSet();
+    const commandEvents: typeof events = [];
+    const commandResponses: string[] = [];
+    for (const event of events) {
+      const command = authorizedControlCommand(phone, String(event.content ?? ""), admins);
+      if (!command) continue;
+      commandEvents.push(event);
+      commandResponses.push(await executeControlCommand(command));
     }
-  }
-  if (invoiceReceived && !contact.bill_received) {
-    contact.bill_received = true;
-    const updated = await db().from("agent_contacts").update({ bill_received: true, updated_at: new Date().toISOString() })
-      .eq("phone", phone);
-    if (updated.error) throw updated.error;
-    await syncContactToCrm(contact);
-  }
-  const incoming = parts.join("\n").trim() || "[Mensaje sin texto]";
+    if (commandResponses.length) {
+      const commandIds = commandEvents.map((event) => event.id);
+      const commandBatchId = `agent-control:${
+        commandEvents.map((event) => event.provider_message_id ?? event.id).join(":")
+      }`;
+      const response = sanitizePlainText(commandResponses.join("\n"));
+      const outboundId = await sendWhatsAppText(phone, response, {
+        dedupeKey: `control:${commandBatchId}`,
+        kind: "control_ack",
+      });
+      const commandName = commandEvents.map((event) => event.contact_name).find(Boolean) ?? null;
+      const commandContact = await ensureCrmContact(phone, commandName);
+      await db().from("agent_messages").upsert({
+        contact_phone: phone,
+        role: "assistant",
+        content: response,
+        provider_message_id: `assistant:${commandBatchId}`,
+        model: "deterministic-control-v2",
+      }, { onConflict: "provider_message_id", ignoreDuplicates: true });
+      await syncMessageToCrm({
+        phone,
+        name: commandContact.name ?? null,
+        role: "assistant",
+        content: response,
+        sourceId: outboundId,
+        model: "deterministic-control-v2",
+      });
+      await markEvents(commandIds, "responded");
+      const commandIdSet = new Set(commandIds);
+      events = events.filter((event) => !commandIdSet.has(event.id));
+      if (!events.length) return;
+    }
 
-  const batchId = `agent-batch:${events.map((event) => event.provider_message_id ?? event.id).join(":")}`;
-  await db().from("agent_messages").upsert({
-    contact_phone: phone,
-    role: "user",
-    content: incoming,
-    provider_message_id: batchId,
-  }, { onConflict: "provider_message_id" });
-  await syncMessageToCrm({ phone, name: contact.name ?? null, role: "user", content: incoming, sourceId: batchId });
-  const processedAt = new Date().toISOString();
+    const ids = events.map((event) => event.id);
+    const name = events.map((event) => event.contact_name).find(Boolean) ?? null;
+    let contact = await ensureCrmContact(phone, name);
 
-  if ((await setting("bot_enabled")) !== "true" || contact.human_mode) {
-    await db().from("agent_inbound_events").update({ processed_at: processedAt }).in("id", events.map((event) => event.id));
-    return;
-  }
+    const parts: string[] = [];
+    for (const event of events) {
+      if (event.content) parts.push(event.content);
+      if (event.media_id || event.media_url) parts.push((await describeAndStoreMedia(event)).description);
+    }
+    const incoming = parts.join("\n").trim() || "[Mensaje sin texto]";
+    const batchId = `agent-batch:${events.map((event) => event.provider_message_id ?? event.id).join(":")}`;
+    const replyKey = `reply:${batchId}`;
+    const messageInsert = await db().from("agent_messages").upsert({
+      contact_phone: phone,
+      role: "user",
+      content: incoming,
+      provider_message_id: batchId,
+    }, { onConflict: "provider_message_id", ignoreDuplicates: true });
+    if (messageInsert.error) throw messageInsert.error;
+    await syncMessageToCrm({
+      phone,
+      name: contact.name ?? null,
+      role: "user",
+      content: incoming,
+      sourceId: batchId,
+    });
 
-  const agendaPhone = normalizePhone(await runtimeSecret("AGENT_AGENDA_PHONE") ?? "");
-  const ricardoPhone = normalizePhone(await runtimeSecret("AGENT_RICARDO_PHONE") ?? "");
-  const guillermoPhone = normalizePhone(await runtimeSecret("AGENT_GUILLERMO_PHONE") ?? "");
-  let responseText: string;
-  if ((agendaPhone && phone === agendaPhone) || (ricardoPhone && phone === ricardoPhone)) {
-    const control = incoming.match(/^\s*(tomar|liberar)\s+\+?(\d{8,15})\s*$/i);
-    if (control) {
-      const target = normalizePhone(control[2]);
-      const humanMode = control[1].toLowerCase() === "tomar";
-      await ensureContact(target, null);
-      await db().from("agent_contacts").update({ human_mode: humanMode }).eq("phone", target);
-      const { data: updated } = await db().from("agent_contacts").select("*").eq("phone", target).single();
-      if (updated) await syncContactToCrm(updated);
-      responseText = humanMode ? `Chat ${target} tomado por humano.` : `Bot liberado para ${target}.`;
+    contact = await ensureCrmContact(phone, name);
+    if ((await setting("bot_enabled")) !== "true") {
+      await markEvents(ids, "bot_disabled");
+      return;
+    }
+    if (contact.human_mode) {
+      await markEvents(ids, "human_mode");
+      return;
+    }
+
+    const agendaPhone = normalizePhone(await runtimeSecret("AGENT_AGENDA_PHONE") ?? "");
+    const ricardoPhone = normalizePhone(await runtimeSecret("AGENT_RICARDO_PHONE") ?? "");
+    const guillermoPhone = normalizePhone(await runtimeSecret("AGENT_GUILLERMO_PHONE") ?? "");
+    let responseText = "";
+    let responseModel = "deterministic-v2";
+    const prepared = await preparedWhatsAppText(replyKey);
+    if (prepared) {
+      responseText = prepared.content;
+      responseModel = prepared.model ?? "prepared-outbox-v2";
+    } else if ((agendaPhone && phone === agendaPhone) || (ricardoPhone && phone === ricardoPhone)) {
+      responseText = sanitizePlainText(await processAgendaMessage(incoming));
+      responseModel = "agenda-v2";
+    } else if (guillermoPhone && phone === guillermoPhone) {
+      await markEvents(ids, "internal_ignored");
+      return;
     } else {
-      responseText = await processAgendaMessage(incoming);
-    }
-  } else if (guillermoPhone && phone === guillermoPhone) {
-    await db().from("agent_inbound_events").update({ processed_at: processedAt }).in("id", events.map((event) => event.id));
-    return;
-  } else {
-    let tipo = contact.tipo;
-    if (!tipo) {
-      tipo = await classifyContact(incoming);
-      await db().from("agent_contacts").update({ tipo }).eq("phone", phone);
-      contact.tipo = tipo;
-      await syncContactToCrm(contact);
+      let category = contactCategory(contact);
+      const chargerScope = chargerScopeFromText(incoming);
+      if (chargerScope) category = "cargador_electrico";
+      if (!contact.tipo || contact.tipo === "otro") {
+        category = chargerScope ? "cargador_electrico" : await classifyContact(incoming);
+      }
+
+      const historyResult = await db().from("agent_messages")
+        .select("role,content").eq("contact_phone", phone).order("created_at", { ascending: false }).limit(
+          40,
+        );
+      if (historyResult.error) throw historyResult.error;
+      const history = (historyResult.data ?? []).reverse().filter((row) =>
+        row.role !== "system"
+      ) as AgentMessage[];
+      const isFirstConversation = !history.some((row) => row.role === "assistant");
+      const initialMissing = conversationMissingFields(category, contact);
+      const decision = deterministicDecision(incoming, category, isFirstConversation) ??
+        await modelDecision(contact, category, initialMissing, history, incoming);
+      category = decision.classification;
+      const storedChargerScope = contact.agent_state?.charger_scope;
+      const effectiveChargerScope = chargerScope ??
+        (["solar_y_cargador", "solo_cargador", "desconocido"].includes(String(storedChargerScope))
+          ? storedChargerScope as AgentDecision["fields"]["charger_scope"]
+          : null);
+      if (effectiveChargerScope === "solar_y_cargador") {
+        category = "cargador_electrico";
+        decision.handoff = false;
+        if (/derivaci[oó]n/i.test(String(decision.label ?? ""))) decision.label = null;
+      } else if (chargerScope && category !== "cargador_electrico") {
+        category = "cargador_electrico";
+      }
+      const patch = safeAgentPatch(
+        contact,
+        {
+          ...decision.fields,
+          ...(effectiveChargerScope ? { charger_scope: effectiveChargerScope } : {}),
+        },
+        category,
+        incoming,
+      );
+      if (decision.label) patch.label = decision.label;
+      contact = await applyContactState({ phone, patch });
+
+      const missing = conversationMissingFields(category, contact);
+      const completeForQuote = isQuoteEligible(category, contact) && missing.length === 0;
+      const academyComplete = category === "academia" && missing.length === 0;
+      const chargerOnly = category === "cargador_electrico" &&
+        contact.agent_state?.charger_scope === "solo_cargador";
+      const needsFollowup = decision.handoff || chargerOnly ||
+        ["cv", "soporte"].includes(category) || academyComplete || completeForQuote;
+      const statePatch: Record<string, unknown> = {
+        agent_state: { missing_fields: missing, last_decision_version: "v3" },
+      };
+      let taskTitle: string | null = null;
+      let taskDescription: string | null = null;
+      if (completeForQuote) {
+        statePatch.stage = "pendiente_presupuesto";
+        statePatch.label = "Pendiente enviar presupuesto";
+        statePatch.notified_ricardo = true;
+        ({ title: taskTitle, description: taskDescription } = taskFor(category, true, contact));
+        responseText =
+          "Perfecto, con esto ya tenemos lo necesario. Voy a pasar la información al equipo de ingeniería para que preparen una propuesta personalizada. En cuanto esté lista te la compartimos.";
+      } else if (academyComplete) {
+        statePatch.label = "Academia Solar";
+        statePatch.notified_ricardo = true;
+        ({ title: taskTitle, description: taskDescription } = taskFor(category, false, contact));
+        responseText =
+          "Perfecto, ya registramos tu interés en la Academia Solar. Te vamos a contactar por email cuando haya novedades.";
+      } else if (needsFollowup) {
+        statePatch.notified_ricardo = true;
+        if (decision.label) statePatch.label = decision.label;
+        if (chargerOnly) statePatch.stage = "contactado";
+        ({ title: taskTitle, description: taskDescription } = taskFor(category, false, contact));
+        responseText = chargerOnly
+          ? "Para un cargador sin sistema solar, voy a pasarle tu contacto a un instalador especializado."
+          : decision.reply;
+      } else {
+        responseText = decision.reply;
+      }
+      contact = await applyContactState({
+        phone,
+        patch: statePatch,
+        taskTitle,
+        taskDescription,
+      });
+      responseModel = await runtimeSecret("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001";
     }
 
-    const { data: rows, error: historyError } = await db().from("agent_messages")
-      .select("role,content").eq("contact_phone", phone).order("created_at", { ascending: false }).limit(30);
-    if (historyError) throw historyError;
-    const history = (rows ?? []).reverse().filter((row) => row.role !== "system") as AgentMessage[];
-    const raw = await askClaude(agentSystemPrompt(contact), history, 900);
-    responseText = cleanResponse(raw);
-
-    const updates: Record<string, unknown> = {};
-    const label = extractLabel(raw);
-    if (label) updates.label = label;
-    if (marker(raw, "DERIVAR_HUMANO")) updates.human_mode = true;
-    if (Object.keys(updates).length) {
-      const { data: updated } = await db().from("agent_contacts").update(updates).eq("phone", phone).select("*").single();
-      if (updated) await syncContactToCrm(updated);
-    }
-    if (marker(raw, "NOTIFICAR_RICARDO") || marker(raw, "DERIVAR_HUMANO")) {
-      await notifyRicardo(contact, history);
-    }
+    responseText = sanitizePlainText(
+      responseText || "Para poder seguir, ¿podés contarme qué necesitás resolver con energía solar?",
+    );
+    const outboundId = await sendWhatsAppText(phone, responseText, {
+      dedupeKey: replyKey,
+      kind: "customer_reply",
+      metadata: { inbound_event_ids: ids, response_model: responseModel },
+    });
+    const assistantSourceId = `assistant:${batchId}`;
+    const assistantInsert = await db().from("agent_messages").upsert({
+      contact_phone: phone,
+      role: "assistant",
+      content: responseText,
+      provider_message_id: assistantSourceId,
+      model: responseModel,
+    }, { onConflict: "provider_message_id", ignoreDuplicates: true });
+    if (assistantInsert.error) throw assistantInsert.error;
+    await syncMessageToCrm({
+      phone,
+      name: contact.name ?? null,
+      role: "assistant",
+      content: responseText,
+      sourceId: outboundId || assistantSourceId,
+      model: responseModel,
+    });
+    await markEvents(ids, "responded");
+  } catch (error) {
+    if (error instanceof InboundProcessingError) throw error;
+    throw new InboundProcessingError(error, allIds);
   }
+}
 
-  if (!responseText) responseText = "Gracias por escribirnos. Un asesor revisara tu consulta.";
-  const outboundId = await sendWhatsAppText(phone, responseText);
-  await db().from("agent_messages").insert({
-    contact_phone: phone,
-    role: "assistant",
-    content: responseText,
-    model: await runtimeSecret("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001",
-  });
-  await syncMessageToCrm({
-    phone,
-    name: contact.name ?? null,
-    role: "assistant",
-    content: responseText,
-    sourceId: outboundId,
-    model: await runtimeSecret("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001",
-  });
-  await db().from("agent_inbound_events").update({ processed_at: processedAt, processing_error: null })
-    .in("id", events.map((event) => event.id));
+async function enqueueIfNeeded(phone: string): Promise<void> {
+  const pending = await db().from("agent_inbound_events").select("id", { count: "exact", head: true })
+    .eq("phone", phone).is("processed_at", null);
+  if (pending.error) throw pending.error;
+  if ((pending.count ?? 0) > 0) {
+    const queued = await db().rpc("agent_enqueue_phone", { p_phone: phone, p_delay_seconds: 1 });
+    if (queued.error) throw queued.error;
+  }
 }
 
 async function finishJob(job: Job, error?: unknown): Promise<void> {
+  const phone = normalizePhone(String(job.payload.phone ?? ""));
   if (!error) {
-    await db().from("agent_jobs").update({
+    const completed = await db().from("agent_jobs").update({
       status: "completed",
       completed_at: new Date().toISOString(),
       last_error: null,
     }).eq("id", job.id);
+    if (completed.error) throw completed.error;
+    if (phone) await enqueueIfNeeded(phone);
     return;
   }
 
-  const attempts = job.attempts + 1;
-  const failed = attempts >= 5;
-  await db().from("agent_jobs").update({
-    status: failed ? "failed" : "pending",
+  const attempts = Number(job.attempts ?? 0) + 1;
+  const terminal = attempts >= 5;
+  const message = errorMessage(error);
+  const update = await db().from("agent_jobs").update({
+    status: terminal ? "failed" : "pending",
     attempts,
     available_at: new Date(Date.now() + Math.min(15, 2 ** attempts) * 60_000).toISOString(),
-    last_error: error instanceof Error ? error.message : String(error),
+    locked_at: null,
+    last_error: message,
   }).eq("id", job.id);
+  if (update.error) throw update.error;
+  if (phone) {
+    const eventPatch = {
+      processing_attempts: attempts,
+      processing_error: message,
+      disposition: terminal ? "dead_letter" : "retrying",
+      disposition_at: new Date().toISOString(),
+      ...(terminal ? { processed_at: new Date().toISOString() } : {}),
+    };
+    const eventIds = error instanceof InboundProcessingError ? error.eventIds : [];
+    const eventUpdate = eventIds.length
+      ? await db().from("agent_inbound_events").update(eventPatch).in("id", eventIds).is("processed_at", null)
+      : await db().from("agent_inbound_events").update(eventPatch).eq("phone", phone).is(
+        "processed_at",
+        null,
+      );
+    if (eventUpdate.error) throw eventUpdate.error;
+    if (terminal) {
+      await applyContactState({
+        phone,
+        patch: { human_mode: true, label: "Revisión humana" },
+        taskTitle: "Responder mensaje con error",
+        taskDescription: `El bot agotó los reintentos. Error: ${message}`,
+      });
+    }
+  }
 }
 
 export async function processDueJobs(limit = 10): Promise<{ completed: number; failed: number }> {
   await db().from("agent_jobs").update({ status: "pending", locked_at: null })
     .eq("status", "processing").lt("locked_at", new Date(Date.now() - 5 * 60_000).toISOString());
+  const claimed = await db().rpc("agent_claim_jobs", { p_limit: limit });
+  if (claimed.error) throw claimed.error;
 
-  const { data: jobs, error } = await db().from("agent_jobs").select("id,dedupe_key,payload,attempts")
-    .eq("status", "pending").lte("available_at", new Date().toISOString()).order("available_at").limit(limit);
-  if (error) throw error;
-
+  const groups = new Map<string, Job[]>();
+  for (const job of (claimed.data ?? []) as Job[]) {
+    const phone = normalizePhone(String(job.payload.phone ?? ""));
+    const key = phone || `invalid:${job.id}`;
+    groups.set(key, [...(groups.get(key) ?? []), job]);
+  }
+  const phoneQueues = [...groups.values()];
   let completed = 0;
   let failed = 0;
-  for (const job of (jobs ?? []) as Job[]) {
-    const { data: locked } = await db().from("agent_jobs").update({
-      status: "processing",
-      locked_at: new Date().toISOString(),
-    }).eq("id", job.id).eq("status", "pending").select("id").maybeSingle();
-    if (!locked) continue;
-
-    try {
-      const phone = normalizePhone(String(job.payload.phone ?? ""));
-      if (!phone) throw new Error("Job has no phone");
-      await processInbound(phone);
-      await finishJob(job);
-      completed += 1;
-    } catch (jobError) {
-      console.error("agent job failed", job.id, jobError);
-      await finishJob(job, jobError);
-      failed += 1;
+  let nextQueue = 0;
+  const worker = async () => {
+    while (nextQueue < phoneQueues.length) {
+      const jobs = phoneQueues[nextQueue++];
+      for (const job of jobs) {
+        try {
+          const phone = normalizePhone(String(job.payload.phone ?? ""));
+          if (!phone) throw new Error("Job has no phone");
+          await processInbound(phone);
+          await finishJob(job);
+          completed += 1;
+        } catch (jobError) {
+          console.error("agent job failed", job.id, errorMessage(jobError));
+          await finishJob(job, jobError);
+          failed += 1;
+        }
+      }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, phoneQueues.length) }, () => worker()));
   return { completed, failed };
 }
 
-export async function runScheduledTasks(): Promise<Record<string, number>> {
-  const queue = await processDueJobs(20);
+export async function runScheduledTasks(): Promise<Record<string, unknown>> {
+  const [queue, outbound] = await Promise.all([processDueJobs(20), retryDueOutboundMessages(20)]);
   let reminders = 0;
-  let notifications = 0;
   const ricardo = normalizePhone(await runtimeSecret("AGENT_RICARDO_PHONE") ?? "");
-
   if (ricardo && (await setting("bot_enabled")) === "true") {
     const now = new Date();
     const horizon = new Date(now.getTime() + 16 * 60_000);
-    const { data: events } = await db().from("agent_agenda_events").select("*")
+    const events = await db().from("agent_agenda_events").select("*")
       .eq("status", "pendiente").eq("reminder_sent", false)
       .gte("date_time", now.toISOString()).lte("date_time", horizon.toISOString()).limit(20);
-    for (const event of events ?? []) {
-      await sendWhatsAppText(ricardo, `Recordatorio: ${event.title} a las ${new Date(event.date_time).toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" })}${event.location ? ` en ${event.location}` : ""}.`);
+    if (events.error) throw events.error;
+    for (const event of events.data ?? []) {
+      const content = sanitizePlainText(
+        `Recordatorio: ${event.title} a las ${
+          new Date(event.date_time).toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" })
+        }${event.location ? ` en ${event.location}` : ""}.`,
+      );
+      await sendWhatsAppText(ricardo, content, {
+        dedupeKey: `agenda-reminder:${event.id}`,
+        kind: "agenda_reminder",
+      });
       await db().from("agent_agenda_events").update({ reminder_sent: true }).eq("id", event.id);
       reminders += 1;
     }
-
-    const { data: pending } = await db().from("agent_pending_notifications").select("*")
-      .eq("sent", false).is("archived_at", null).order("created_at").limit(10);
-    for (const item of pending ?? []) {
-      try {
-        await sendWhatsAppText(item.phone, item.message);
-        await db().from("agent_pending_notifications").update({ sent: true, sent_at: new Date().toISOString(), last_error: null }).eq("id", item.id);
-        notifications += 1;
-      } catch (error) {
-        await db().from("agent_pending_notifications").update({ last_error: error instanceof Error ? error.message : String(error) }).eq("id", item.id);
-      }
-    }
   }
-  return { ...queue, reminders, notifications };
+  const dailyReport = await maybeSendDailyReport();
+  return { ...queue, outbound, reminders, daily_report: dailyReport };
 }

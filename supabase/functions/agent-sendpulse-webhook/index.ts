@@ -1,13 +1,20 @@
 import { db, json, runtimeSecret, setting } from "../_shared/db.ts";
-import { syncContactToCrm } from "../_shared/crm-compat.ts";
+import { applyContactState } from "../_shared/crm-compat.ts";
+import { errorMessage } from "../_shared/errors.ts";
 import { normalizePhone } from "../_shared/meta.ts";
 import { processDueJobs } from "../_shared/processor.ts";
+import { enqueuePhone, payloadHash, recordWebhookError, recordWebhookReceipt } from "../_shared/webhook.ts";
 
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
 
 const OUTGOING_TITLES = new Set([
-  "outgoing_message", "message_sent", "operator_message", "admin_message",
-  "sent_message", "human_message", "agent_message",
+  "outgoing_message",
+  "message_sent",
+  "operator_message",
+  "admin_message",
+  "sent_message",
+  "human_message",
+  "agent_message",
 ]);
 const HUMAN_TAG = /humano|human|manual|pausad|tomado|asesor|operador|ricardo/i;
 
@@ -20,15 +27,31 @@ function safeEqual(expected: string | null, supplied: string | null): boolean {
   return mismatch === 0;
 }
 
+function firstPhone(payload: Record<string, any>, message: Record<string, any>): string {
+  const candidates = [
+    payload?.contact?.phone,
+    payload?.phone,
+    message?.from,
+    message?.phone,
+    payload?.info?.message?.contact?.phone,
+    payload?.info?.message?.channel_data?.contact?.phone,
+  ];
+  return normalizePhone(
+    String(candidates.find((candidate) => candidate !== null && candidate !== undefined) ?? ""),
+  );
+}
+
 function parseEvent(payload: Record<string, any>) {
   const channel = payload?.info?.message?.channel_data?.message ?? {};
   const message = payload?.info?.message ?? payload?.message ?? {};
-  const type = channel?.type ?? message?.type ?? "unknown";
+  const type = String(channel?.type ?? message?.type ?? "unknown").toLowerCase();
   const media = channel?.[type] ?? message?.[type] ?? {};
   let content = channel?.text?.body ?? channel?.text ?? message?.text?.body ?? message?.text ?? null;
   if (type === "location") {
     const location = channel?.location ?? message?.location ?? {};
-    content = `Ubicacion: ${location.latitude ?? ""}, ${location.longitude ?? ""}${location.name || location.address ? ` - ${location.name ?? location.address}` : ""}`;
+    content = `Ubicación: ${location.latitude ?? ""}, ${location.longitude ?? ""}${
+      location.name || location.address ? ` - ${location.name ?? location.address}` : ""
+    }`;
   } else if (!content && ["image", "document", "video", "audio"].includes(type)) {
     content = media?.caption ?? media?.filename ?? `[Archivo recibido: ${type}]`;
   } else if (!content && type === "unsupported") {
@@ -36,123 +59,181 @@ function parseEvent(payload: Record<string, any>) {
   }
   const tags = Array.isArray(payload?.contact?.tags) ? payload.contact.tags : [];
   return {
-    phone: normalizePhone(String(payload?.contact?.phone ?? "")),
+    phone: firstPhone(payload, message),
     contactName: payload?.contact?.name ? String(payload.contact.name) : null,
     contactId: payload?.contact?.id ? String(payload.contact.id) : null,
     type,
     content: content ? String(content) : null,
     mediaUrl: media?.url ? String(media.url) : null,
     mimeType: media?.mime_type ? String(media.mime_type) : null,
-    title: String(payload?.title ?? "unknown"),
-    isOutgoing: OUTGOING_TITLES.has(String(payload?.title ?? "unknown")) ||
+    title: String(payload?.title ?? "unknown").toLowerCase(),
+    isOutgoing: OUTGOING_TITLES.has(String(payload?.title ?? "unknown").toLowerCase()) ||
       message?.direction === "outgoing" || message?.from_me === true,
-    humanTagged: tags.some((tag: unknown) => HUMAN_TAG.test(typeof tag === "string" ? tag : JSON.stringify(tag))),
+    humanTagged: tags.some((tag: unknown) =>
+      HUMAN_TAG.test(typeof tag === "string" ? tag : JSON.stringify(tag))
+    ),
   };
 }
 
 async function eventId(payload: Record<string, any>, phone: string): Promise<string> {
-  const explicit = payload?.info?.message?.channel_data?.message?.id ?? payload?.info?.message?.id ?? payload?.message?.id;
+  const explicit = payload?.info?.message?.channel_data?.message?.id ??
+    payload?.info?.message?.id ?? payload?.message?.id ?? payload?.event_id;
   if (explicit) return `sendpulse:${explicit}`;
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${phone}:${JSON.stringify(payload)}`));
-  return `sendpulse:${Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+  return `sendpulse:${await payloadHash({ phone, payload })}`;
+}
+
+async function internalPhones(): Promise<Set<string>> {
+  const configured = await Promise.all([
+    runtimeSecret("AGENT_RICARDO_PHONE"),
+    runtimeSecret("AGENT_AGENDA_PHONE"),
+    runtimeSecret("AGENT_GUILLERMO_PHONE"),
+    runtimeSecret("AGENT_INTERNAL_PHONES"),
+  ]);
+  return new Set(
+    configured.flatMap((value) => String(value ?? "").split(/[;,\s]+/))
+      .map((value) => normalizePhone(value))
+      .filter(Boolean),
+  );
 }
 
 async function setHumanMode(phone: string, name: string | null): Promise<void> {
-  const { data: existing, error: lookupError } = await db().from("agent_contacts").select("name")
-    .eq("phone", phone).maybeSingle();
-  if (lookupError) throw lookupError;
-  const row = {
-    phone,
-    name: existing?.name ?? name,
-    human_mode: true,
-    last_contact: new Date().toISOString(),
-  };
-  const query = existing
-    ? db().from("agent_contacts").update(row).eq("phone", phone)
-    : db().from("agent_contacts").insert(row);
-  const { data, error } = await query.select("*").single();
-  if (error) throw error;
-  await syncContactToCrm(data);
+  await applyContactState({ phone, patch: { name, human_mode: true } });
 }
 
 async function isBotEcho(phone: string, content: string | null): Promise<boolean> {
   if (!content) return false;
-  const { data, error } = await db().from("agent_messages").select("content")
-    .eq("contact_phone", phone).eq("role", "assistant").order("created_at", { ascending: false }).limit(1).maybeSingle();
-  if (error) throw error;
   const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
-  const previousContent = typeof data?.content === "string" ? data.content : null;
-  return previousContent !== null && normalize(previousContent) === normalize(content);
-}
-
-async function schedulePhone(phone: string): Promise<void> {
-  const { error } = await db().from("agent_jobs").upsert({
-    dedupe_key: `inbound:${phone}`,
-    job_type: "process_inbound",
-    payload: { phone },
-    status: "pending",
-    attempts: 0,
-    available_at: new Date(Date.now() + 20_000).toISOString(),
-    locked_at: null,
-    completed_at: null,
-    last_error: null,
-  }, { onConflict: "dedupe_key" });
+  const recentOutbound = await db().from("agent_outbound_messages")
+    .select("content,provider_message_id,status")
+    .eq("phone", phone)
+    .in("status", ["sending", "sent", "delivered", "read"])
+    .gte("created_at", new Date(Date.now() - 15 * 60_000).toISOString())
+    .order("created_at", { ascending: false })
+    .limit(20);
+  if (recentOutbound.error) throw recentOutbound.error;
+  if (
+    (recentOutbound.data ?? []).some((row) => normalize(String(row.content ?? "")) === normalize(content))
+  ) {
+    return true;
+  }
+  const { data, error } = await db().from("agent_messages").select("content")
+    .eq("contact_phone", phone).eq("role", "assistant").order("created_at", { ascending: false }).limit(1)
+    .maybeSingle();
   if (error) throw error;
+  return typeof data?.content === "string" && normalize(data.content) === normalize(content);
 }
 
-async function processPayload(raw: unknown): Promise<number> {
+async function processPayload(
+  raw: unknown,
+): Promise<{ accepted: number; ignored: number; duplicates: number }> {
   const payloads = Array.isArray(raw) ? raw : [raw];
   const phones = new Set<string>();
+  const admins = await internalPhones();
   let accepted = 0;
+  let ignored = 0;
+  let duplicates = 0;
+
   for (const candidate of payloads) {
-    if (!candidate || typeof candidate !== "object") continue;
+    const fallbackId = `invalid:${await payloadHash(candidate)}`;
+    if (!candidate || typeof candidate !== "object") {
+      await recordWebhookReceipt({
+        provider: "sendpulse",
+        providerEventId: fallbackId,
+        outcome: "rejected",
+        reason: "invalid_payload",
+        payload: candidate,
+      });
+      ignored += 1;
+      continue;
+    }
     const payload = candidate as Record<string, any>;
     const event = parseEvent(payload);
-    if (!event.phone) continue;
-    if (event.isOutgoing) {
-      const internal = await Promise.all([
-        runtimeSecret("AGENT_RICARDO_PHONE"),
-        runtimeSecret("AGENT_AGENDA_PHONE"),
-        runtimeSecret("AGENT_GUILLERMO_PHONE"),
-      ]);
-      const internalPhones = internal.map((value) => normalizePhone(value ?? "")).filter(Boolean);
-      if (!internalPhones.includes(event.phone) && !(await isBotEcho(event.phone, event.content))) {
-        await setHumanMode(event.phone, event.contactName);
-      }
-      continue;
-    }
-    if (event.title !== "incoming_message" && event.title !== "unknown") continue;
-    if (event.humanTagged) {
-      await setHumanMode(event.phone, event.contactName);
-      continue;
-    }
-    const providerMessageId = await eventId(payload, event.phone);
-    const { error } = await db().from("agent_inbound_events").upsert({
-      provider_message_id: providerMessageId,
+    const providerEventId = await eventId(payload, event.phone || "unknown");
+    const receiptBase = {
       provider: "sendpulse",
-      provider_contact_id: event.contactId,
-      phone: event.phone,
-      contact_name: event.contactName,
-      message_type: event.type,
-      content: event.content,
-      media_url: event.mediaUrl,
-      media_mime_type: event.mimeType,
-      raw_payload: payload,
-      received_at: new Date().toISOString(),
-    }, { onConflict: "provider_message_id", ignoreDuplicates: true });
-    if (error) throw error;
-    phones.add(event.phone);
-    accepted += 1;
+      providerEventId,
+      phone: event.phone || null,
+      payload,
+      metadata: { title: event.title, type: event.type, contact_id: event.contactId },
+    };
+    try {
+      if (!event.phone) {
+        await recordWebhookReceipt({ ...receiptBase, outcome: "ignored", reason: "missing_phone" });
+        ignored += 1;
+        continue;
+      }
+      if (event.isOutgoing) {
+        const botEcho = await isBotEcho(event.phone, event.content);
+        if (!admins.has(event.phone) && !botEcho) await setHumanMode(event.phone, event.contactName);
+        await recordWebhookReceipt({
+          ...receiptBase,
+          outcome: "ignored",
+          reason: botEcho ? "bot_echo" : admins.has(event.phone) ? "internal_outgoing" : "human_outgoing",
+        });
+        ignored += 1;
+        continue;
+      }
+      if (event.title !== "incoming_message" && event.title !== "unknown") {
+        await recordWebhookReceipt({
+          ...receiptBase,
+          outcome: "ignored",
+          reason: `unsupported_title:${event.title}`,
+        });
+        ignored += 1;
+        continue;
+      }
+      if (event.humanTagged) {
+        await setHumanMode(event.phone, event.contactName);
+        await recordWebhookReceipt({ ...receiptBase, outcome: "ignored", reason: "human_tag" });
+        ignored += 1;
+        continue;
+      }
+
+      const inserted = await db().from("agent_inbound_events").upsert({
+        provider_message_id: providerEventId,
+        provider: "sendpulse",
+        provider_contact_id: event.contactId,
+        phone: event.phone,
+        contact_name: event.contactName,
+        message_type: event.type,
+        content: event.content,
+        media_url: event.mediaUrl,
+        media_mime_type: event.mimeType,
+        raw_payload: payload,
+        received_at: new Date().toISOString(),
+        disposition: "pending",
+      }, { onConflict: "provider_message_id", ignoreDuplicates: true }).select("id").maybeSingle();
+      if (inserted.error) throw inserted.error;
+      if (!inserted.data) {
+        await recordWebhookReceipt({ ...receiptBase, outcome: "duplicate", reason: "provider_message_id" });
+        duplicates += 1;
+        continue;
+      }
+      await recordWebhookReceipt({
+        ...receiptBase,
+        outcome: "accepted",
+        inboundEventId: inserted.data.id,
+      });
+      phones.add(event.phone);
+      accepted += 1;
+    } catch (error) {
+      await recordWebhookError("sendpulse", providerEventId, payload, error, event.phone);
+      throw error;
+    }
   }
-  for (const phone of phones) await schedulePhone(phone);
+
+  for (const phone of phones) await enqueuePhone(phone, 5);
   if (phones.size) {
     EdgeRuntime.waitUntil((async () => {
-      await new Promise((resolve) => setTimeout(resolve, 21_000));
-      try { await processDueJobs(Math.max(phones.size, 10)); }
-      catch (error) { console.error("agent sendpulse background processor", error); }
+      await new Promise((resolve) => setTimeout(resolve, 6_000));
+      try {
+        await processDueJobs(Math.max(phones.size, 10));
+      } catch (error) {
+        console.error("agent sendpulse background processor", errorMessage(error));
+      }
     })());
   }
-  return accepted;
+  return { accepted, ignored, duplicates };
 }
 
 Deno.serve(async (req: Request) => {
@@ -162,10 +243,9 @@ Deno.serve(async (req: Request) => {
   const supplied = url.searchParams.get("token") ?? req.headers.get("x-agent-webhook-secret");
   if (!safeEqual(expected, supplied)) return json({ error: "invalid_webhook_secret" }, 401);
   try {
-    const accepted = await processPayload(await req.json());
-    return json({ received: true, accepted });
+    return json({ received: true, ...await processPayload(await req.json()) });
   } catch (error) {
-    console.error("agent-sendpulse-webhook", error);
+    console.error("agent-sendpulse-webhook", errorMessage(error));
     return json({ error: "webhook_processing_failed" }, 500);
   }
 });

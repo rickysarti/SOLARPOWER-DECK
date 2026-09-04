@@ -1,0 +1,15 @@
+{
+  "name": "solarpower-deck-agent",
+  "private": true,
+  "scripts": {
+    "check": "deno task check",
+    "eval": "deno task eval",
+    "test": "deno task test",
+    "supabase": "supabase"
+  },
+  "devDependencies": {
+    "deno-bin": "2.2.7",
+    "supabase": "2.116.0"
+  },
+  "packageManager": "pnpm@10.17.1"
+}

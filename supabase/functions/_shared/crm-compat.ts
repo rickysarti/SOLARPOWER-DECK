@@ -1,9 +1,29 @@
 import { db } from "./db.ts";
 
 const CONTACT_COLUMNS = [
-  "phone", "name", "email", "label", "stage", "tipo", "bill_received",
-  "roof_type", "connection_type", "locality", "product_interest", "notes",
-  "notified_ricardo", "human_mode", "first_contact", "last_contact",
+  "phone",
+  "name",
+  "email",
+  "label",
+  "stage",
+  "tipo",
+  "bill_received",
+  "roof_type",
+  "connection_type",
+  "locality",
+  "province",
+  "product_interest",
+  "notes",
+  "notified_ricardo",
+  "human_mode",
+  "first_contact",
+  "last_contact",
+  "consumo_mensual",
+  "consumo_anual",
+  "agent_state",
+  "assigned_to",
+  "bandeja",
+  "bandeja_source",
 ];
 
 export async function readCrmContact(phone: string): Promise<Record<string, any> | null> {
@@ -14,18 +34,53 @@ export async function readCrmContact(phone: string): Promise<Record<string, any>
 }
 
 export async function syncContactToCrm(contact: Record<string, any>): Promise<void> {
-  const row = Object.fromEntries(CONTACT_COLUMNS
-    .filter((key) => contact[key] !== undefined)
-    .map((key) => [key, contact[key]]));
-  row.updated_at = new Date().toISOString();
-  row.last_activity_at = contact.last_contact ?? row.updated_at;
-  const { error } = await db().from("chatbot_wa_contacts").upsert(row, { onConflict: "phone" });
+  const phone = String(contact.phone ?? "").replace(/\D/g, "");
+  if (!phone) throw new Error("Contact has no phone");
+  const patch = Object.fromEntries(
+    CONTACT_COLUMNS
+      .filter((key) => key !== "phone" && contact[key] !== undefined)
+      .map((key) => [key, contact[key]]),
+  );
+  const { error } = await db().rpc("agent_apply_contact_state", {
+    p_phone: phone,
+    p_patch: patch,
+    p_task_title: null,
+    p_task_description: null,
+  });
   if (error) throw error;
+}
+
+export async function ensureCrmContact(
+  phone: string,
+  name: string | null,
+): Promise<Record<string, any> & { phone: string }> {
+  const { data, error } = await db().rpc("agent_ensure_contact", { p_phone: phone, p_name: name });
+  if (error) throw error;
+  if (!data || typeof data !== "object") throw new Error("Contact could not be ensured");
+  return data as Record<string, any> & { phone: string };
+}
+
+export async function applyContactState(input: {
+  phone: string;
+  patch: Record<string, unknown>;
+  taskTitle?: string | null;
+  taskDescription?: string | null;
+}): Promise<Record<string, any> & { phone: string }> {
+  const { data, error } = await db().rpc("agent_apply_contact_state", {
+    p_phone: input.phone,
+    p_patch: input.patch,
+    p_task_title: input.taskTitle ?? null,
+    p_task_description: input.taskDescription ?? null,
+  });
+  if (error) throw error;
+  if (!data || typeof data !== "object") throw new Error("Contact state was not applied");
+  return data as Record<string, any> & { phone: string };
 }
 
 async function conversationId(phone: string, name: string | null): Promise<string> {
   const { data: existing, error } = await db().from("chatbot_conversations").select("id")
-    .eq("contact_phone", phone).eq("channel", "whatsapp").order("created_at", { ascending: false }).limit(1).maybeSingle();
+    .eq("contact_phone", phone).eq("channel", "whatsapp").order("created_at", { ascending: false }).limit(1)
+    .maybeSingle();
   if (error) throw error;
   if (existing?.id) return existing.id;
   const { data, error: insertError } = await db().from("chatbot_conversations").insert({
@@ -49,7 +104,8 @@ export async function syncMessageToCrm(input: {
 }): Promise<void> {
   const conversation = await conversationId(input.phone, input.name);
   const { data: duplicate, error: lookupError } = await db().from("chatbot_messages").select("id")
-    .eq("conversation_id", conversation).contains("metadata", { agent_source_id: input.sourceId }).limit(1).maybeSingle();
+    .eq("conversation_id", conversation).contains("metadata", { agent_source_id: input.sourceId }).limit(1)
+    .maybeSingle();
   if (lookupError) throw lookupError;
   if (duplicate) return;
   const { error } = await db().from("chatbot_messages").insert({
@@ -60,7 +116,10 @@ export async function syncMessageToCrm(input: {
     metadata: { source: "agent-supabase", agent_source_id: input.sourceId },
   });
   if (error) throw error;
-  await db().from("chatbot_conversations").update({ updated_at: new Date().toISOString() }).eq("id", conversation);
+  await db().from("chatbot_conversations").update({ updated_at: new Date().toISOString() }).eq(
+    "id",
+    conversation,
+  );
 }
 
 export async function syncActionToCrm(action: Record<string, any>): Promise<void> {

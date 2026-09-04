@@ -13,7 +13,11 @@ async function requestToken(force = false): Promise<string> {
   const response = await fetch(`${API_BASE}/oauth/access_token`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ grant_type: "client_credentials", client_id: clientId, client_secret: clientSecret }),
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: clientId,
+      client_secret: clientSecret,
+    }),
   });
   const result = await response.json();
   if (!response.ok || !result?.access_token) throw new Error(`SendPulse OAuth ${response.status}`);
@@ -29,14 +33,19 @@ async function botId(): Promise<string> {
   const configured = await runtimeSecret("SENDPULSE_BOT_ID");
   if (configured) return botIdCache = configured;
   const token = await requestToken();
-  const response = await fetch(`${API_BASE}/whatsapp/bots`, { headers: { authorization: `Bearer ${token}` } });
+  const response = await fetch(`${API_BASE}/whatsapp/bots`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
   const result = await response.json();
   const bots = Array.isArray(result?.data) ? result.data : Array.isArray(result) ? result : [];
   if (!response.ok || !bots[0]?.id) throw new Error("No SendPulse WhatsApp bot is available");
   return botIdCache = String(bots[0].id);
 }
 
-function splitText(text: string, maxChars = 300): string[] {
+// SendPulse allows up to 512 characters for a WhatsApp text message. Keep a
+// small safety margin so normal customer replies are always delivered as one
+// coherent message instead of being split mid-sentence.
+export function splitText(text: string, maxChars = 500): string[] {
   if (text.length <= maxChars) return [text];
   const chunks: string[] = [];
   let remaining = text.trim();
@@ -47,7 +56,9 @@ function splitText(text: string, maxChars = 300): string[] {
     }
     const window = remaining.slice(0, maxChars + 1);
     const boundary = Math.max(window.lastIndexOf("\n"), window.lastIndexOf(". "), window.lastIndexOf(" "));
-    const end = boundary > maxChars * 0.55 ? boundary + (window.slice(boundary, boundary + 2) === ". " ? 1 : 0) : maxChars;
+    const end = boundary > maxChars * 0.55
+      ? boundary + (window.slice(boundary, boundary + 2) === ". " ? 1 : 0)
+      : maxChars;
     chunks.push(remaining.slice(0, end).trim());
     remaining = remaining.slice(end).trim();
   }
@@ -67,7 +78,11 @@ async function sendChunk(phone: string, text: string, attempt = 0): Promise<Reco
   });
   const raw = await response.text();
   let result: Record<string, unknown> = {};
-  try { result = raw ? JSON.parse(raw) : {}; } catch { result = { response: raw.slice(0, 300) }; }
+  try {
+    result = raw ? JSON.parse(raw) : {};
+  } catch {
+    result = { response: raw.slice(0, 300) };
+  }
   const retryable = response.status === 401 || response.status === 408 || response.status === 425 ||
     response.status === 429 || response.status >= 500 ||
     (response.status === 400 && /temporar|unavailable|try again|timeout|internal error/i.test(raw));
@@ -80,12 +95,17 @@ async function sendChunk(phone: string, text: string, attempt = 0): Promise<Reco
   return result;
 }
 
+export async function sendSendPulseChunk(phone: string, content: string): Promise<string> {
+  const result: any = await sendChunk(phone, content);
+  return String(result?.data?.message_id ?? result?.message_id ?? result?.id ?? "") ||
+    `sendpulse:${crypto.randomUUID()}`;
+}
+
 export async function sendSendPulseText(phone: string, content: string): Promise<string> {
   let messageId: string | null = null;
   const chunks = splitText(content);
   for (let index = 0; index < chunks.length; index += 1) {
-    const result: any = await sendChunk(phone, chunks[index]);
-    messageId = String(result?.data?.message_id ?? result?.message_id ?? result?.id ?? messageId ?? "") || null;
+    messageId = await sendSendPulseChunk(phone, chunks[index]);
     if (index < chunks.length - 1) await new Promise((resolve) => setTimeout(resolve, 1500));
   }
   return messageId ?? `sendpulse:${crypto.randomUUID()}`;

@@ -38,24 +38,39 @@ Deno.serve(async (req: Request) => {
       return json({ skipped: true, reason: "newapp_disabled", task });
     }
     const scheduledBucket = bucket(task, body?.scheduled_at, force);
-    const inserted = await db().from("newapp_bot_runs").insert({ task, scheduled_bucket: scheduledBucket, status: "processing" })
+    const inserted = await db().from("newapp_bot_runs").insert({
+      task,
+      scheduled_bucket: scheduledBucket,
+      status: "processing",
+    })
       .select("id").maybeSingle();
     if (inserted.error) {
-      if (inserted.error.code === "23505") return json({ skipped: true, reason: "duplicate_bucket", task, scheduledBucket });
+      if (inserted.error.code === "23505") {
+        return json({ skipped: true, reason: "duplicate_bucket", task, scheduledBucket });
+      }
       throw inserted.error;
     }
     const runId = inserted.data!.id;
     try {
       const result = await executeNewappTask(task);
       const updated = await db().from("newapp_bot_runs").update({
-        status: "completed", processed: result.processed, succeeded: result.succeeded, failed: result.failed,
-        result, completed_at: new Date().toISOString(), last_error: null,
+        status: "completed",
+        processed: result.processed,
+        succeeded: result.succeeded,
+        failed: result.failed,
+        result,
+        completed_at: new Date().toISOString(),
+        last_error: null,
       }).eq("id", runId);
       if (updated.error) throw updated.error;
       return json({ runId, task, ...result });
     } catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 1200);
-      await db().from("newapp_bot_runs").update({ status: "failed", last_error: message, completed_at: new Date().toISOString() }).eq("id", runId);
+      await db().from("newapp_bot_runs").update({
+        status: "failed",
+        last_error: message,
+        completed_at: new Date().toISOString(),
+      }).eq("id", runId);
       throw error;
     }
   } catch (error) {

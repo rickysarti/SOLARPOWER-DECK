@@ -1,15 +1,37 @@
 import { db, json } from "../_shared/db.ts";
 import { createGoogleEvent } from "../_shared/google-calendar.ts";
 import { normalizePhone } from "../_shared/meta.ts";
-import { syncAgendaToCrm, syncContactToCrm } from "../_shared/crm-compat.ts";
+import { applyContactState, syncAgendaToCrm } from "../_shared/crm-compat.ts";
 
 const CONTACT_FIELDS = new Set([
-  "name", "email", "label", "stage", "tipo", "bill_received", "roof_type",
-  "connection_type", "locality", "product_interest", "notes", "human_mode",
+  "name",
+  "email",
+  "label",
+  "stage",
+  "tipo",
+  "bill_received",
+  "roof_type",
+  "connection_type",
+  "locality",
+  "province",
+  "product_interest",
+  "notes",
+  "human_mode",
+  "consumo_mensual",
+  "consumo_anual",
 ]);
 const AGENDA_FIELDS = new Set([
-  "title", "description", "date_time", "duration_minutes", "location", "event_type",
-  "contact_name", "contact_phone", "attendee_emails", "status", "reminder_sent",
+  "title",
+  "description",
+  "date_time",
+  "duration_minutes",
+  "location",
+  "event_type",
+  "contact_name",
+  "contact_phone",
+  "attendee_emails",
+  "status",
+  "reminder_sent",
 ]);
 
 function cors(req: Request): Record<string, string> {
@@ -51,10 +73,15 @@ function routeParts(url: URL): string[] {
 async function contacts(req: Request, url: URL, parts: string[]): Promise<Response> {
   if (parts.length === 1 && req.method === "GET") {
     const limit = Math.min(Number(url.searchParams.get("limit") ?? 100), 500);
-    let query = db().from("agent_contacts").select("*").order("last_contact", { ascending: false }).limit(limit);
+    let query = db().from("chatbot_wa_contacts").select("*").order("last_contact", { ascending: false })
+      .limit(limit);
     const search = url.searchParams.get("search");
     const stage = url.searchParams.get("stage");
-    if (search) query = query.or(`name.ilike.%${search.replace(/[,%()]/g, "") }%,phone.ilike.%${search.replace(/[,%()]/g, "")}%`);
+    if (search) {
+      query = query.or(
+        `name.ilike.%${search.replace(/[,%()]/g, "")}%,phone.ilike.%${search.replace(/[,%()]/g, "")}%`,
+      );
+    }
     if (stage) query = query.eq("stage", stage);
     const { data, error } = await query;
     if (error) throw error;
@@ -65,19 +92,19 @@ async function contacts(req: Request, url: URL, parts: string[]): Promise<Respon
   if (!phone) return response(req, { error: "invalid_phone" }, 400);
   if (req.method === "GET") {
     const [{ data: contact, error }, { data: messages }, { data: actions }] = await Promise.all([
-      db().from("agent_contacts").select("*").eq("phone", phone).maybeSingle(),
+      db().from("chatbot_wa_contacts").select("*").eq("phone", phone).maybeSingle(),
       db().from("agent_messages").select("*").eq("contact_phone", phone).order("created_at").limit(500),
-      db().from("agent_pending_actions").select("*").eq("contact_phone", phone).order("created_at", { ascending: false }),
+      db().from("agent_pending_actions").select("*").eq("contact_phone", phone).order("created_at", {
+        ascending: false,
+      }),
     ]);
     if (error) throw error;
     return response(req, { contact, messages, actions });
   }
   if (req.method === "PATCH") {
     const updates = pick(await req.json(), CONTACT_FIELDS);
-    const { data, error } = await db().from("agent_contacts").update(updates).eq("phone", phone).select("*").single();
-    if (error) throw error;
-    await syncContactToCrm(data);
-    return response(req, { contact: data });
+    const contact = await applyContactState({ phone, patch: updates });
+    return response(req, { contact });
   }
   return response(req, { error: "method_not_allowed" }, 405);
 }
@@ -92,16 +119,23 @@ async function agenda(req: Request, url: URL, parts: string[]): Promise<Response
   }
   if (parts.length === 1 && req.method === "POST") {
     const event = pick(await req.json(), AGENDA_FIELDS);
-    if (!event.title || !event.date_time) return response(req, { error: "title_and_date_time_required" }, 400);
+    if (!event.title || !event.date_time) {
+      return response(req, { error: "title_and_date_time_required" }, 400);
+    }
     const googleEventId = await createGoogleEvent(event as any);
-    const { data, error } = await db().from("agent_agenda_events").insert({ ...event, google_event_id: googleEventId }).select("*").single();
+    const { data, error } = await db().from("agent_agenda_events").insert({
+      ...event,
+      google_event_id: googleEventId,
+    }).select("*").single();
     if (error) throw error;
     await syncAgendaToCrm(data);
     return response(req, { event: data }, 201);
   }
   if (parts[1] && req.method === "PATCH") {
     const updates = pick(await req.json(), AGENDA_FIELDS);
-    const { data, error } = await db().from("agent_agenda_events").update(updates).eq("id", parts[1]).select("*").single();
+    const { data, error } = await db().from("agent_agenda_events").update(updates).eq("id", parts[1]).select(
+      "*",
+    ).single();
     if (error) throw error;
     await syncAgendaToCrm(data);
     return response(req, { event: data });
@@ -135,21 +169,31 @@ Deno.serve(async (req: Request) => {
     }
     if (parts[0] === "stats" && req.method === "GET") {
       const [{ count: contactsCount }, { count: openActions }, { count: messagesToday }] = await Promise.all([
-        db().from("agent_contacts").select("*", { count: "exact", head: true }),
+        db().from("chatbot_wa_contacts").select("*", { count: "exact", head: true }),
         db().from("agent_pending_actions").select("*", { count: "exact", head: true }).eq("resolved", false),
         db().from("agent_messages").select("*", { count: "exact", head: true })
           .gte("created_at", new Date(new Date().setHours(0, 0, 0, 0)).toISOString()),
       ]);
-      return response(req, { contacts: contactsCount ?? 0, open_actions: openActions ?? 0, messages_today: messagesToday ?? 0 });
+      return response(req, {
+        contacts: contactsCount ?? 0,
+        open_actions: openActions ?? 0,
+        messages_today: messagesToday ?? 0,
+      });
     }
     if (parts[0] === "settings" && req.method === "GET") {
-      const { data, error } = await db().from("agent_settings").select("key,value,is_secret").eq("is_secret", false).order("key");
+      const { data, error } = await db().from("agent_settings").select("key,value,is_secret").eq(
+        "is_secret",
+        false,
+      ).order("key");
       if (error) throw error;
       return response(req, { settings: data });
     }
     if (parts[0] === "settings" && parts[1] === "bot_enabled" && req.method === "PATCH") {
       const enabled = Boolean((await req.json()).enabled);
-      const { error } = await db().from("agent_settings").update({ value: String(enabled) }).eq("key", "bot_enabled");
+      const { error } = await db().from("agent_settings").update({ value: String(enabled) }).eq(
+        "key",
+        "bot_enabled",
+      );
       if (error) throw error;
       return response(req, { bot_enabled: enabled });
     }

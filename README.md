@@ -18,7 +18,7 @@ Storage y Cron. No requieren un servidor Windows o Node encendido permanentement
 ## Flujo
 
 1. SendPulse envia el webhook a `agent-sendpulse-webhook`.
-2. El webhook valida su secreto, guarda el evento y programa un trabajo con 20
+2. El webhook valida su secreto, guarda el evento y programa un trabajo con 5
    segundos de buffer por contacto.
 3. `agent-process-queue` agrupa mensajes, consulta el historial, llama a Claude
    y responde mediante la API de WhatsApp de SendPulse.

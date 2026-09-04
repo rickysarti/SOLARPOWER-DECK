@@ -38,19 +38,24 @@ export async function createGoogleEvent(event: CalendarEvent): Promise<string | 
   const end = new Date(start.getTime() + (event.duration_minutes ?? 60) * 60_000);
   const attendees = (event.attendee_emails ?? "").split(",").map((email) => email.trim()).filter(Boolean)
     .map((email) => ({ email }));
-  const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?sendUpdates=all`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      summary: event.title,
-      description: event.description ?? undefined,
-      location: event.location ?? undefined,
-      start: { dateTime: start.toISOString(), timeZone: "America/Argentina/Buenos_Aires" },
-      end: { dateTime: end.toISOString(), timeZone: "America/Argentina/Buenos_Aires" },
-      attendees: attendees.length ? attendees : undefined,
-    }),
-  });
+  const response = await fetch(
+    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?sendUpdates=all`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        summary: event.title,
+        description: event.description ?? undefined,
+        location: event.location ?? undefined,
+        start: { dateTime: start.toISOString(), timeZone: "America/Argentina/Buenos_Aires" },
+        end: { dateTime: end.toISOString(), timeZone: "America/Argentina/Buenos_Aires" },
+        attendees: attendees.length ? attendees : undefined,
+      }),
+    },
+  );
   const result = await response.json();
-  if (!response.ok) throw new Error(`Google Calendar ${response.status}: ${JSON.stringify(result).slice(0, 300)}`);
+  if (!response.ok) {
+    throw new Error(`Google Calendar ${response.status}: ${JSON.stringify(result).slice(0, 300)}`);
+  }
   return result.id ?? null;
 }

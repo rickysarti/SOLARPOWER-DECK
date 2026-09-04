@@ -1,0 +1,101 @@
+[
+  {
+    "id": "pre_aug_generic_greeting",
+    "period": "pre_august",
+    "incoming": "Hola",
+    "expectedCategory": "residencial",
+    "expectedHandoff": false,
+    "mustContain": ["Tomás", "SolarPower"],
+    "mustNotContain": ["formulario", "Ricardo"]
+  },
+  {
+    "id": "pre_aug_course",
+    "period": "pre_august",
+    "incoming": "Quería consultar por el curso de instalación de paneles solares",
+    "expectedCategory": "academia",
+    "expectedHandoff": true,
+    "mustContain": ["Academia"],
+    "mustNotContain": ["precio confirmado", "fecha confirmada"]
+  },
+  {
+    "id": "pre_aug_industrial",
+    "period": "pre_august",
+    "incoming": "Buscamos un sistema solar para una fábrica con consumo alto",
+    "expectedCategory": "comercial",
+    "expectedHandoff": false,
+    "mustContain": [],
+    "mustNotContain": ["precio final", "disponibilidad garantizada"]
+  },
+  {
+    "id": "august_off_grid",
+    "period": "august",
+    "incoming": "Quiero presupuesto para un sistema off grid en el interior de Córdoba",
+    "expectedCategory": "residencial",
+    "expectedHandoff": false,
+    "mustContain": [],
+    "mustNotContain": ["no trabajamos en el interior", "Ricardo"]
+  },
+  {
+    "id": "august_existing_battery",
+    "period": "august",
+    "incoming": "Me interesa una batería para sumar a mi sistema solar existente",
+    "expectedCategory": "soporte",
+    "expectedHandoff": true,
+    "mustContain": [],
+    "mustNotContain": ["cuesta", "stock confirmado"]
+  },
+  {
+    "id": "august_academy",
+    "period": "august",
+    "incoming": "Estoy interesado en el curso, ¿pueden enviarme información?",
+    "expectedCategory": "academia",
+    "expectedHandoff": true,
+    "mustContain": ["Academia"],
+    "mustNotContain": ["empieza el", "cuesta"]
+  },
+  {
+    "id": "recent_lighting_regression",
+    "period": "recent_failure",
+    "incoming": "Necesito luminarias para un galpón",
+    "expectedCategory": "otro",
+    "expectedHandoff": false,
+    "mustContain": ["no vende ni instala luminarias"],
+    "mustNotContain": ["sí, hacemos luminarias"]
+  },
+  {
+    "id": "recent_cv_formatting",
+    "period": "recent_failure",
+    "incoming": "Adjunto mi CV porque quiero trabajar como técnico",
+    "expectedCategory": "cv",
+    "expectedHandoff": true,
+    "mustContain": ["info@solarpower.com.ar"],
+    "mustNotContain": ["dos asteriscos", "emoji solar"]
+  },
+  {
+    "id": "charger_only",
+    "period": "new_requirement",
+    "incoming": "Quiero solamente un cargador eléctrico para mi auto",
+    "expectedCategory": "cargador_electrico",
+    "expectedHandoff": true,
+    "mustContain": ["instalador"],
+    "mustNotContain": ["+54", "precio"]
+  },
+  {
+    "id": "solar_and_charger",
+    "period": "new_requirement",
+    "incoming": "Quiero paneles solares para mi casa y también un wallbox",
+    "expectedCategory": "cargador_electrico",
+    "expectedHandoff": false,
+    "mustContain": [],
+    "mustNotContain": ["no hacemos", "te paso el número"]
+  },
+  {
+    "id": "support_existing_system",
+    "period": "recent_failure",
+    "incoming": "Ya soy cliente y el inversor de mi instalación muestra una falla",
+    "expectedCategory": "soporte",
+    "expectedHandoff": true,
+    "mustContain": [],
+    "mustNotContain": ["cambialo vos", "solución garantizada"]
+  }
+]

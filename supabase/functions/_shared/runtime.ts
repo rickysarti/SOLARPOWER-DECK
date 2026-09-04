@@ -1,4 +1,5 @@
 import { db } from "./db.ts";
+import { sanitizePlainText } from "./output.ts";
 
 type SecretNamespace = "energy" | "newapp";
 type SecretGetter = (name: string) => Promise<string | null>;
@@ -12,11 +13,14 @@ async function namespacedSecret(namespace: SecretNamespace, name: string): Promi
   if (environmentValue) return environmentValue;
   const cacheKey = `${namespace}:${name}`;
   if (!secretCache.has(cacheKey)) {
-    secretCache.set(cacheKey, (async () => {
-      const { data, error } = await db().rpc(`${namespace}_get_runtime_secret`, { p_name: name });
-      if (error) throw error;
-      return typeof data === "string" && data ? data : null;
-    })());
+    secretCache.set(
+      cacheKey,
+      (async () => {
+        const { data, error } = await db().rpc(`${namespace}_get_runtime_secret`, { p_name: name });
+        if (error) throw error;
+        return typeof data === "string" && data ? data : null;
+      })(),
+    );
   }
   return await secretCache.get(cacheKey)!;
 }
@@ -24,7 +28,10 @@ async function namespacedSecret(namespace: SecretNamespace, name: string): Promi
 export const energySecret = (name: string) => namespacedSecret("energy", name);
 export const newappSecret = (name: string) => namespacedSecret("newapp", name);
 
-export async function runtimeSetting(table: "energy_analysis_settings" | "newapp_bot_settings", key: string): Promise<string | null> {
+export async function runtimeSetting(
+  table: "energy_analysis_settings" | "newapp_bot_settings",
+  key: string,
+): Promise<string | null> {
   const { data, error } = await db().from(table).select("value").eq("key", key).maybeSingle();
   if (error) throw error;
   return data?.value ?? null;
@@ -93,7 +100,9 @@ function splitText(text: string, maxChars = 3800): string[] {
     }
     const window = remaining.slice(0, maxChars + 1);
     const boundary = Math.max(window.lastIndexOf("\n"), window.lastIndexOf(". "), window.lastIndexOf(" "));
-    const end = boundary > maxChars * 0.55 ? boundary + (window.slice(boundary, boundary + 2) === ". " ? 1 : 0) : maxChars;
+    const end = boundary > maxChars * 0.55
+      ? boundary + (window.slice(boundary, boundary + 2) === ". " ? 1 : 0)
+      : maxChars;
     chunks.push(remaining.slice(0, end).trim());
     remaining = remaining.slice(end).trim();
   }
@@ -109,7 +118,11 @@ async function sendPulseToken(namespace: string, secret: SecretGetter, force = f
   const { data } = await fetchJson<any>("https://api.sendpulse.com/oauth/access_token", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ grant_type: "client_credentials", client_id: clientId, client_secret: clientSecret }),
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: clientId,
+      client_secret: clientSecret,
+    }),
   }, "SendPulse OAuth");
   if (!data?.access_token) throw new Error("SendPulse OAuth returned no access token");
   const token = String(data.access_token);
@@ -147,8 +160,10 @@ export async function sendPulseText(
 ): Promise<string> {
   const normalizedPhone = phone.replace(/[^0-9]/g, "");
   if (!normalizedPhone) throw new Error("SendPulse destination phone is invalid");
+  const cleanContent = sanitizePlainText(content);
+  if (!cleanContent) throw new Error("SendPulse content became empty after sanitization");
   let messageId = "";
-  for (const chunk of splitText(content)) {
+  for (const chunk of splitText(cleanContent)) {
     let attempt = 0;
     while (true) {
       try {
@@ -165,7 +180,10 @@ export async function sendPulseText(
         messageId = String(data?.data?.message_id ?? data?.message_id ?? data?.id ?? messageId);
         break;
       } catch (error) {
-        if (attempt >= 2 || !(error instanceof HttpError) || ![401, 408, 425, 429, 500, 502, 503, 504].includes(error.status)) {
+        if (
+          attempt >= 2 || !(error instanceof HttpError) ||
+          ![401, 408, 425, 429, 500, 502, 503, 504].includes(error.status)
+        ) {
           throw error;
         }
         attempt += 1;

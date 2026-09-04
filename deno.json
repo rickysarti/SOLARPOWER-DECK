@@ -1,0 +1,18 @@
+{
+  "nodeModulesDir": "auto",
+  "compilerOptions": {
+    "strict": true
+  },
+  "fmt": {
+    "lineWidth": 110,
+    "semiColons": true,
+    "singleQuote": false,
+    "include": ["supabase/functions", "supabase/tests", "scripts"]
+  },
+  "tasks": {
+    "check": "deno check supabase/functions/agent-sendpulse-webhook/index.ts supabase/functions/agent-whatsapp-webhook/index.ts supabase/functions/agent-process-queue/index.ts supabase/functions/agent-cron/index.ts supabase/functions/agent-health/index.ts supabase/functions/agent-admin-api/index.ts supabase/functions/energy-analyze/index.ts",
+    "eval": "deno run --allow-read --allow-env --allow-net scripts/evaluate-agent.ts",
+    "test": "deno test supabase/tests",
+    "fmt": "deno fmt"
+  }
+}

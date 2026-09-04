@@ -12,6 +12,10 @@ import {
   replyRequestsField,
 } from "../functions/_shared/processor.ts";
 import { splitText } from "../functions/_shared/sendpulse.ts";
+import {
+  isInboundSendPulseMessage,
+  sendPulseMessageContent,
+} from "../functions/_shared/sendpulse-reconcile.ts";
 import { assert, assertEquals } from "./assert.ts";
 
 Deno.test("sanitiza emojis, asteriscos y markdown", () => {
@@ -134,4 +138,20 @@ Deno.test("todos los prompts incluyen la política compartida de cargadores y se
     assert(prompt.includes("no vende ni instala luminarias"));
     assert(prompt.includes("una sola pregunta"));
   }
+});
+
+Deno.test("interpreta un mensaje entrante recuperado desde el historial de SendPulse", () => {
+  const message = {
+    id: "sendpulse-message-id",
+    direction: 1,
+    created_at: "2026-09-04T15:13:00Z",
+    data: { type: "text", text: { body: "Tengo techo de chapa común" } },
+  };
+  assertEquals(isInboundSendPulseMessage(message), true);
+  assertEquals(sendPulseMessageContent(message), {
+    type: "text",
+    content: "Tengo techo de chapa común",
+    mediaUrl: null,
+    mimeType: null,
+  });
 });

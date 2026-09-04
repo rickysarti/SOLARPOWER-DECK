@@ -23,6 +23,7 @@ import { errorMessage } from "./errors.ts";
 import { normalizePhone } from "./meta.ts";
 import { sanitizePlainText } from "./output.ts";
 import { agentSystemPrompt, type ContactPromptData } from "./prompts.ts";
+import { reconcileSendPulseInbound } from "./sendpulse-reconcile.ts";
 import {
   downloadWhatsAppMedia,
   preparedWhatsAppText,
@@ -871,6 +872,15 @@ export async function processDueJobs(limit = 10): Promise<{ completed: number; f
 }
 
 export async function runScheduledTasks(): Promise<Record<string, unknown>> {
+  let reconciliation: Record<string, unknown> = { skipped: "provider_not_sendpulse" };
+  if ((await setting("whatsapp_provider")) === "sendpulse") {
+    try {
+      reconciliation = await reconcileSendPulseInbound();
+    } catch (error) {
+      console.error("sendpulse reconciliation failed", errorMessage(error));
+      reconciliation = { error: errorMessage(error) };
+    }
+  }
   const [queue, outbound] = await Promise.all([processDueJobs(20), retryDueOutboundMessages(20)]);
   let reminders = 0;
   const ricardo = normalizePhone(await runtimeSecret("AGENT_RICARDO_PHONE") ?? "");
@@ -896,5 +906,5 @@ export async function runScheduledTasks(): Promise<Record<string, unknown>> {
     }
   }
   const dailyReport = await maybeSendDailyReport();
-  return { ...queue, outbound, reminders, daily_report: dailyReport };
+  return { ...queue, outbound, reconciliation, reminders, daily_report: dailyReport };
 }

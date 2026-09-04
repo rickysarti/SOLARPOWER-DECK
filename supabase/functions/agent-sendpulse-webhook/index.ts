@@ -76,8 +76,10 @@ function parseEvent(payload: Record<string, any>) {
 }
 
 async function eventId(payload: Record<string, any>, phone: string): Promise<string> {
-  const explicit = payload?.info?.message?.channel_data?.message?.id ??
-    payload?.info?.message?.id ?? payload?.message?.id ?? payload?.event_id;
+  // Prefer SendPulse's own message ID because it is also returned by the chat
+  // history API used to reconcile a webhook that was not delivered.
+  const explicit = payload?.info?.message?.id ?? payload?.message?.id ??
+    payload?.info?.message?.channel_data?.message?.id ?? payload?.event_id;
   if (explicit) return `sendpulse:${explicit}`;
   return `sendpulse:${await payloadHash({ phone, payload })}`;
 }

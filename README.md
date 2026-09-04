@@ -22,7 +22,9 @@ Storage y Cron. No requieren un servidor Windows o Node encendido permanentement
    segundos de buffer por contacto.
 3. `agent-process-queue` agrupa mensajes, consulta el historial, llama a Claude
    y responde mediante la API de WhatsApp de SendPulse.
-4. `agent-cron` corre cada minuto como respaldo, procesa reintentos y avisos de
+4. `agent-cron` concilia los chats recientes con el historial de SendPulse y
+   recupera mensajes entrantes cuyo webhook no haya llegado.
+5. `agent-cron` corre cada minuto como respaldo, procesa reintentos y avisos de
    agenda.
 
 ## Funciones

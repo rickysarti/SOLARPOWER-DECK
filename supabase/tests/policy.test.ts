@@ -11,13 +11,11 @@ import { agentSystemPrompt } from "../functions/_shared/prompts.ts";
 import {
   deterministicDecision,
   explicitFieldsFromConversation,
-  fallbackContinuation,
   isQuoteStatusFollowup,
-  nextRequiredField,
-  previouslyRequestedMissingField,
   repeatedAssistantQuestionField,
   repeatsPreviousAssistantReply,
   replyRequestsField,
+  uncertaintyHandoffDecision,
 } from "../functions/_shared/processor.ts";
 import { splitText } from "../functions/_shared/sendpulse.ts";
 import {
@@ -124,13 +122,6 @@ Deno.test("detecta preguntas reformuladas que vuelven a pedir el mismo dato", ()
     repeatedAssistantQuestionField(reformulated, history),
     "factura, consumo o lista de cargas",
   );
-  assertEquals(
-    previouslyRequestedMissingField(
-      ["factura, consumo o lista de cargas", "techo o superficie"],
-      history,
-    ),
-    "factura, consumo o lista de cargas",
-  );
 });
 
 Deno.test("el debounce vence un minuto después del último mensaje", () => {
@@ -173,45 +164,16 @@ Deno.test("una respuesta comercial normal se envía completa en un solo mensaje"
   assertEquals(splitText(response)[0], response);
 });
 
-Deno.test("si el modelo falla se continúa preguntando un solo dato", () => {
-  const academy = fallbackContinuation(
-    { phone: "5491100000000", name: "Tobias" },
-    "academia",
-    ["nombre completo", "email", "localidad o provincia"],
-    "Busco capacitarme en general",
-  );
-  assert(academy.reply.includes("nombre completo"));
-  assertEquals(academy.handoff, false);
-  assertEquals((academy.reply.match(/\?/g) ?? []).length, 1);
-
-  const residential = fallbackContinuation(
-    { phone: "5491100000001" },
-    "residencial",
-    ["factura, consumo o lista de cargas", "techo o superficie"],
-    "6600 kWh/año",
-  );
-  assertEquals(residential.fields.consumo_anual, 6600);
-  assert(residential.reply.includes("techo"));
-  assertEquals(residential.handoff, false);
+Deno.test("si Claude no puede responder con seguridad deriva a modo humano", () => {
+  const decision = uncertaintyHandoffDecision("residencial");
+  assertEquals(decision.handoff, true);
+  assertEquals(decision.label, "Revisión humana");
+  assertEquals((decision.reply.match(/\?/g) ?? []).length, 0);
 });
 
-Deno.test("la respuesta debe pedir el primer dato que sigue faltando", () => {
-  const missing = ["factura, consumo o lista de cargas", "techo o superficie", "tipo de conexión"];
-  assertEquals(nextRequiredField(missing, { consumo_anual: 6600 }), "techo o superficie");
+Deno.test("la detección de preguntas repetidas es sólo una barrera de seguridad", () => {
   assert(replyRequestsField("¿Qué tipo de techo tenés?", "techo o superficie"));
   assertEquals(replyRequestsField("¿Cuál es tu email?", "nombre completo"), false);
-});
-
-Deno.test("una consulta de batería en cuotas recibe una aclaración segura y sigue calificando", () => {
-  const decision = fallbackContinuation(
-    { phone: "5491100000002", product_interest: "Batería solar" },
-    "residencial",
-    ["factura, consumo o lista de cargas", "techo o superficie"],
-    "Necesito una batería solar, ¿la ofrecen en cuotas?",
-  );
-  assert(decision.reply.includes("dependen de cada propuesta"));
-  assert(decision.reply.includes("sistema solar instalado"));
-  assertEquals(decision.handoff, false);
 });
 
 Deno.test("el formato impropio del modelo se sanea sin cortar la conversación", () => {
@@ -241,13 +203,16 @@ Deno.test("todos los prompts incluyen la política compartida de cargadores y se
       "otro",
     ] as const
   ) {
-    const prompt = agentSystemPrompt({ phone: "5491100000000" }, category, []);
+    const prompt = agentSystemPrompt({ phone: "5491100000000" }, category);
     assert(prompt.includes("Solar más cargador"));
     assert(prompt.includes("Solo cargador"));
     assert(prompt.includes("todo el país"));
     assert(prompt.includes("no vende ni instala luminarias"));
     assert(prompt.includes("una sola pregunta"));
     assert(prompt.includes("presupuesto pendiente"));
+    assert(prompt.includes("prometió enviar algo después"));
+    assert(prompt.includes("No te obligan a preguntar nada"));
+    assert(prompt.includes("Ante cualquier duda real"));
   }
 });
 

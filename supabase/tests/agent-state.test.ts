@@ -1,6 +1,5 @@
 import {
   conversationMissingFields,
-  deferredRequiredField,
   explicitAgentFields,
   isQuoteEligible,
   quoteMissingFields,
@@ -143,24 +142,4 @@ Deno.test("recupera datos explícitos antiguos aunque hayan quedado fuera del es
   assertEquals(explicitAgentFields("475 kWh", "factura, consumo o lista de cargas"), {
     consumo_mensual: 475,
   });
-});
-
-Deno.test("no vuelve a exigir un dato que el cliente decidió definir después", () => {
-  const field = deferredRequiredField(
-    "Pasame presupuesto y después vemos cómo colocar los paneles",
-    "techo o superficie",
-  );
-  assertEquals(field, "techo o superficie");
-  assertEquals(
-    conversationMissingFields("residencial", {
-      product_interest: "off-grid",
-      connection_type: "off-grid sin red eléctrica",
-      locality: "San Juan",
-      agent_state: {
-        consumption_evidence: "lista de equipos proporcionada",
-        skipped_fields: [field],
-      },
-    }),
-    [],
-  );
 });

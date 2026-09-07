@@ -179,15 +179,6 @@ export function explicitAgentFields(
   return fields;
 }
 
-export function deferredRequiredField(incoming: string, currentField: string | null): string | null {
-  if (!currentField) return null;
-  return /\b(?:despu[eé]s\s+(?:vemos|lo vemos|se ve)|m[aá]s adelante|pasame|p[aá]same|mandame|m[aá]ndame)\b.{0,80}\b(?:presupuesto|cotizaci[oó]n|vemos|definimos|colocar|instalar)\b/i
-      .test(incoming) ||
-      /\b(?:no importa|no hay problema|donde tenga que ser|por recomendaci[oó]n)\b/i.test(incoming)
-    ? currentField
-    : null;
-}
-
 function hasFullName(value: unknown): boolean {
   const words = String(value ?? "").match(/\p{L}+(?:['’-]\p{L}+)?/gu) ?? [];
   return words.length >= 2;

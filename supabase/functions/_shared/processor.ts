@@ -3,7 +3,6 @@ import { processAgendaMessage } from "./agenda.ts";
 import {
   contactCategory,
   conversationMissingFields,
-  deferredRequiredField,
   explicitAgentFields,
   isQuoteEligible,
   safeAgentPatch,
@@ -476,42 +475,17 @@ export function repeatedAssistantQuestionField(
   ) ?? null;
 }
 
-export function previouslyRequestedMissingField(
-  missing: string[],
-  history: AgentMessage[],
-): string | null {
-  const previous = previousAssistantReply(history);
-  if (!previous) return null;
-  return missing.find((field) => replyRequestsField(previous, field)) ?? null;
-}
-
 async function modelDecision(
   contact: ContactPromptData,
   category: AgentCategory,
-  missing: string[],
   history: AgentMessage[],
   incoming: string,
-  doNotRepeatField: string | null = null,
 ): Promise<AgentDecision> {
-  if (doNotRepeatField && missing.length === 0) {
-    return {
-      reply: "Perfecto, tomo esta aclaración y dejo actualizado lo que ya me contaste.",
-      classification: category,
-      fields: explicitFallbackFields(incoming),
-      missingFields: [doNotRepeatField],
-      completeForQuote: false,
-      handoff: false,
-      handoffReason: null,
-      label: null,
-    };
-  }
-  let correction = doNotRepeatField
-    ? `El mensaje anterior del asistente ya preguntó por ${doNotRepeatField}. No vuelvas a pedirlo ni lo reformules en esta respuesta. Tomá la nueva información y avanzá con otro dato faltante; si no hay otro, respondé sólo con un acuse breve, sin pregunta ni cierre del relevamiento.`
-    : undefined;
+  let correction: string | undefined;
   let lastError = "";
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const raw = await askClaude(agentSystemPrompt(contact, category, missing, correction), history, 1200);
+      const raw = await askClaude(agentSystemPrompt(contact, category, correction), history, 1200);
       const decision = parseAgentDecision(raw, category);
       const violations = replyViolations(decision.reply, incoming);
       if (repeatsPreviousAssistantReply(decision.reply, history)) {
@@ -520,15 +494,6 @@ async function modelDecision(
       const repeatedQuestion = repeatedAssistantQuestionField(decision.reply, history);
       if (repeatedQuestion) {
         violations.push(`repite la pregunta anterior sobre ${repeatedQuestion}`);
-      }
-      const requiredField = nextRequiredField(missing, decision.fields);
-      if (
-        requiredField && category !== "cv" && category !== "soporte" && category !== "otro" &&
-        !(category === "cargador_electrico" &&
-          (chargerScopeFromText(incoming) ?? contact.agent_state?.charger_scope) === "solo_cargador") &&
-        !replyRequestsField(decision.reply, requiredField)
-      ) {
-        violations.push(`no pregunta por el próximo dato obligatorio: ${requiredField}`);
       }
       if (violations.length) {
         correction = violations.join("; ");
@@ -541,8 +506,22 @@ async function modelDecision(
       correction = `La salida no fue JSON válido o incumplió el contrato. Corregila. Motivo: ${lastError}`;
     }
   }
-  console.error("agent model response rejected; using deterministic continuation", lastError);
-  return fallbackContinuation(contact, category, missing, incoming);
+  console.error("agent model response rejected; handing conversation to a human", lastError);
+  return uncertaintyHandoffDecision(category);
+}
+
+export function uncertaintyHandoffDecision(category: AgentCategory): AgentDecision {
+  return {
+    reply:
+      "Gracias por explicarlo. Para no hacerte repetir información ni interpretar mal tu caso, voy a pasar la conversación al equipo para que continúe personalmente por este medio.",
+    classification: category,
+    fields: {},
+    missingFields: [],
+    completeForQuote: false,
+    handoff: true,
+    handoffReason: "El asistente no pudo determinar una respuesta segura con suficiente confianza",
+    label: "Revisión humana",
+  };
 }
 
 function contactWithPatch(
@@ -579,36 +558,6 @@ async function hasUnbatchedInbound(phone: string, batchIds: string[]): Promise<b
   return (pending.data ?? []).some((event) => !batch.has(String(event.id)));
 }
 
-function fieldResolved(field: string, fields: AgentDecision["fields"]): boolean {
-  switch (field) {
-    case "nombre completo":
-      return String(fields.name ?? "").trim().split(/\s+/).length >= 2;
-    case "email":
-      return Boolean(fields.email);
-    case "localidad o provincia":
-      return Boolean(fields.locality || fields.province);
-    case "factura, consumo o lista de cargas":
-      return Boolean(
-        fields.bill_received || fields.consumo_mensual || fields.consumo_anual || fields.consumption_evidence,
-      );
-    case "techo o superficie":
-      return Boolean(fields.roof_type);
-    case "tipo de conexión":
-      return Boolean(fields.connection_type);
-    case "necesidad o producto":
-      return Boolean(fields.product_interest);
-    default:
-      return false;
-  }
-}
-
-export function nextRequiredField(
-  missing: string[],
-  fields: AgentDecision["fields"],
-): string | null {
-  return missing.find((field) => !fieldResolved(field, fields)) ?? null;
-}
-
 export function replyRequestsField(reply: string, field: string): boolean {
   const patterns: Record<string, RegExp> = {
     "nombre completo": /\b(nombre completo|nombre y apellido|c[oó]mo te llam)/i,
@@ -621,89 +570,6 @@ export function replyRequestsField(reply: string, field: string): boolean {
       /\b(ahorro|cortes?|respaldo|independencia|bater[ií]a|on[ -]?grid|sistema solar|objetivo|motiv|qu[eé] (?:busc[aá]s|quer[eé]s lograr))/i,
   };
   return (patterns[field]?.test(reply) ?? true) && reply.includes("?");
-}
-
-function explicitFallbackFields(incoming: string): AgentDecision["fields"] {
-  const fields: AgentDecision["fields"] = {};
-  const annual = incoming.match(/\b([0-9][0-9.,]*)\s*kwh\s*(?:\/|por\s+)?\s*(?:a[nñ]o|anual(?:es)?)\b/i);
-  const monthly = incoming.match(/\b([0-9][0-9.,]*)\s*kwh\s*(?:\/|por\s+)?\s*mes\b/i);
-  const parseNumber = (value: string) => Number(value.replace(/\./g, "").replace(",", "."));
-  if (annual) {
-    const value = parseNumber(annual[1]);
-    if (Number.isFinite(value) && value > 0) fields.consumo_anual = value;
-  }
-  if (monthly) {
-    const value = parseNumber(monthly[1]);
-    if (Number.isFinite(value) && value > 0) fields.consumo_mensual = value;
-  }
-  const name = incoming.match(
-    /\b(?:me llamo|mi nombre es)\s+([\p{L}][\p{L}'’-]{1,40}(?:\s+[\p{L}][\p{L}'’-]{1,40}){0,3})/iu,
-  )?.[1];
-  if (name) fields.name = name.trim();
-  return fields;
-}
-
-export function fallbackContinuation(
-  contact: ContactPromptData,
-  category: AgentCategory,
-  missing: string[],
-  incoming: string,
-): AgentDecision {
-  const fields = explicitFallbackFields(incoming);
-  const resolved = new Set<string>();
-  if (fields.consumo_anual || fields.consumo_mensual) resolved.add("factura, consumo o lista de cargas");
-  if (fields.name && String(fields.name).trim().split(/\s+/).length >= 2) resolved.add("nombre completo");
-  const next = missing.find((field) => !resolved.has(field));
-  let reply: string;
-  if (/\bbater[ií]a\b/i.test(incoming) && /\b(cuotas?|financiaci[oó]n|financiar)\b/i.test(incoming)) {
-    reply =
-      "Las opciones de pago dependen de cada propuesta. ¿Ya tenés un sistema solar instalado o buscás uno completo con paneles y batería?";
-  } else if (category === "academia") {
-    if (next === "nombre completo") {
-      reply =
-        "Perfecto, te interesa capacitarte como instalador. ¿Me decís tu nombre completo para registrar la consulta?";
-    } else if (next === "email") {
-      reply =
-        "Perfecto, ya registré tu nombre. ¿Cuál es tu email para avisarte cuando haya novedades de la Academia Solar?";
-    } else if (next === "localidad o provincia") reply = "Gracias. ¿De qué localidad sos?";
-    else {
-      reply =
-        "Perfecto, ya quedó registrado tu interés en la Academia Solar. Te vamos a contactar por email cuando haya novedades.";
-    }
-  } else if (category === "cv") {
-    reply = "Gracias por tu interés en sumarte a SolarPower. ¿Podés enviar tu CV a info@solarpower.com.ar?";
-  } else if (category === "soporte") {
-    reply = "Entiendo. ¿Qué equipo o parte de la instalación está presentando el problema?";
-  } else if (category === "cargador_electrico") {
-    reply = "¿Buscás el cargador junto con un sistema solar o únicamente el cargador?";
-  } else if (next === "necesidad o producto") {
-    reply =
-      "Para orientarte bien, ¿buscás principalmente ahorro, respaldo ante cortes o independencia total de la red?";
-  } else if (next === "factura, consumo o lista de cargas") {
-    const ambiguous = incoming.match(/\bpromedio\s+anual\s+([0-9][0-9.,]*)\b/i)?.[1];
-    reply = ambiguous
-      ? `¿Esos ${ambiguous} corresponden al promedio mensual en kWh?`
-      : "¿Tenés una factura reciente o el consumo mensual aproximado en kWh?";
-  } else if (next === "techo o superficie") {
-    reply = "¿Qué tipo de techo o superficie tenés disponible para instalar los paneles?";
-  } else if (next === "tipo de conexión") {
-    reply = "¿La conexión eléctrica es monofásica, trifásica o no tenés red?";
-  } else if (next === "localidad o provincia") {
-    reply = "¿En qué localidad y provincia sería la instalación?";
-  } else {
-    reply =
-      "Perfecto, con esto ya tenemos los datos principales. El equipo va a preparar una propuesta personalizada.";
-  }
-  return {
-    reply,
-    classification: category,
-    fields,
-    missingFields: missing,
-    completeForQuote: false,
-    handoff: false,
-    handoffReason: null,
-    label: null,
-  };
 }
 
 async function processInbound(phone: string): Promise<void> {
@@ -852,15 +718,6 @@ async function processInbound(phone: string): Promise<void> {
       contact = contactWithPatch(storedContact, explicitPatch) as typeof contact;
 
       const isFirstConversation = !history.some((row) => row.role === "assistant");
-      const initialMissing = conversationMissingFields(category, contact);
-      const deferredField = deferredRequiredField(incoming, initialMissing[0] ?? null);
-      const decisionMissing = deferredField
-        ? initialMissing.filter((field) => field !== deferredField)
-        : initialMissing;
-      const repeatedQuestionField = previouslyRequestedMissingField(decisionMissing, history);
-      const modelMissing = repeatedQuestionField
-        ? decisionMissing.filter((field) => field !== repeatedQuestionField)
-        : decisionMissing;
       const explicitHumanHandoff = requestsHumanRepresentative(incoming);
       const quoteAlreadyQueued = contact.stage === "pendiente_presupuesto" ||
         contact.label === "Pendiente enviar presupuesto";
@@ -882,10 +739,8 @@ async function processInbound(phone: string): Promise<void> {
           await modelDecision(
             contact,
             category,
-            quoteAlreadyQueued ? [] : modelMissing,
             history,
             incoming,
-            quoteAlreadyQueued ? null : repeatedQuestionField,
           );
       category = decision.classification;
       const storedChargerScope = contact.agent_state?.charger_scope;
@@ -910,18 +765,6 @@ async function processInbound(phone: string): Promise<void> {
         category,
         historyEvidence || incoming,
       );
-      if (deferredField) {
-        const skipped = new Set<string>(
-          Array.isArray(contact.agent_state?.skipped_fields)
-            ? contact.agent_state.skipped_fields.map((field: unknown) => String(field))
-            : [],
-        );
-        skipped.add(deferredField);
-        patch.agent_state = {
-          ...(patch.agent_state as Record<string, unknown>),
-          skipped_fields: [...skipped],
-        };
-      }
       if (decision.label) patch.label = decision.label;
       contact = contactWithPatch(storedContact, patch) as typeof contact;
 
@@ -933,7 +776,7 @@ async function processInbound(phone: string): Promise<void> {
       const needsFollowup = decision.handoff || chargerOnly ||
         ["cv", "soporte"].includes(category) || academyComplete || completeForQuote;
       const statePatch: Record<string, unknown> = {
-        agent_state: { missing_fields: missing, last_decision_version: "v5" },
+        agent_state: { missing_fields: missing, last_decision_version: "v6" },
       };
       let taskTitle: string | null = null;
       let taskDescription: string | null = null;
@@ -944,14 +787,23 @@ async function processInbound(phone: string): Promise<void> {
         taskTitle = "Revisar presupuesto pendiente";
         taskDescription = "El cliente informó que todavía no recibió la propuesta prometida.";
         responseText = decision.reply;
-      } else if (explicitHumanHandoff) {
+      } else if (explicitHumanHandoff || decision.handoff) {
         statePatch.human_mode = true;
-        statePatch.label = "Solicita representante";
+        statePatch.label = explicitHumanHandoff
+          ? "Solicita representante"
+          : decision.label ?? "Revisión humana";
         statePatch.notified_ricardo = true;
-        taskTitle = "Contactar cliente que pidió un representante";
-        taskDescription = `El cliente pidió continuar con una persona. Motivo: ${
-          decision.handoffReason ?? "solicitud explícita"
-        }`;
+        if (explicitHumanHandoff) {
+          taskTitle = "Contactar cliente que pidió un representante";
+          taskDescription = `El cliente pidió continuar con una persona. Motivo: ${
+            decision.handoffReason ?? "solicitud explícita"
+          }`;
+        } else {
+          ({ title: taskTitle, description: taskDescription } = taskFor(category, false, contact));
+          taskDescription = `${taskDescription ?? "Continuar la conversación personalmente."} Motivo: ${
+            decision.handoffReason ?? "el asistente indicó revisión humana"
+          }`;
+        }
         responseText = decision.reply;
       } else if (completeForQuote && !quoteAlreadyQueued) {
         statePatch.stage = "pendiente_presupuesto";

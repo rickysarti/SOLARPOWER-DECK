@@ -9,6 +9,7 @@ import {
 import { hasForbiddenFormatting, sanitizePlainText } from "../functions/_shared/output.ts";
 import { agentSystemPrompt } from "../functions/_shared/prompts.ts";
 import {
+  academyCompletionDecision,
   deterministicDecision,
   explicitFieldsFromConversation,
   isQuoteStatusFollowup,
@@ -165,9 +166,32 @@ Deno.test("una respuesta comercial normal se envía completa en un solo mensaje"
 });
 
 Deno.test("si Claude no puede responder con seguridad deriva a modo humano", () => {
-  const decision = uncertaintyHandoffDecision("residencial");
+  const decision = uncertaintyHandoffDecision("residencial", "respuesta repetida");
   assertEquals(decision.handoff, true);
   assertEquals(decision.label, "Revisión humana");
+  assert(decision.handoffReason?.includes("respuesta repetida"));
+  assertEquals((decision.reply.match(/\?/g) ?? []).length, 0);
+});
+
+Deno.test("academia completa informa el estado real sin derivar a una persona", () => {
+  const decision = academyCompletionDecision({
+    phone: "5491157150566",
+    name: "Mauro David Rodríguez",
+    email: "maurodavidrodriguez@hotmail.com.ar",
+  });
+  assertEquals(decision.handoff, false);
+  assertEquals(decision.label, "Academia Solar");
+  assert(decision.reply.includes("está en preparación"));
+  assert(decision.reply.includes("terminando de armar los contenidos y la modalidad"));
+  assert(decision.reply.includes("avisar por email"));
+  assertEquals((decision.reply.match(/\?/g) ?? []).length, 0);
+});
+
+Deno.test("academia sin datos personales registra el interés y avisa por WhatsApp", () => {
+  const decision = academyCompletionDecision({ phone: "5491100000000" });
+  assertEquals(decision.handoff, false);
+  assert(decision.reply.includes("registramos tu interés"));
+  assert(decision.reply.includes("avisar por este medio"));
   assertEquals((decision.reply.match(/\?/g) ?? []).length, 0);
 });
 
@@ -213,6 +237,12 @@ Deno.test("todos los prompts incluyen la política compartida de cargadores y se
     assert(prompt.includes("prometió enviar algo después"));
     assert(prompt.includes("No te obligan a preguntar nada"));
     assert(prompt.includes("Ante cualquier duda real"));
+    if (category === "academia") {
+      assert(prompt.includes("todavía está en preparación"));
+      assert(prompt.includes("No inicies un formulario"));
+      assert(prompt.includes("ni pidas nombre, email, localidad"));
+      assert(prompt.includes("handoff=false"));
+    }
   }
 });
 

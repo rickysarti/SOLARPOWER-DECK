@@ -55,16 +55,16 @@ Deno.test("el agente no pisa un cambio manual del CRM", () => {
   assertEquals(patch.email, "lead@example.com");
 });
 
-Deno.test("academia pide nombre completo, email y localidad, no datos solares", () => {
+Deno.test("academia no inicia un formulario ni exige datos personales o solares", () => {
   assertEquals(
     conversationMissingFields("academia", { name: "Tobias", email: null, locality: null }),
-    ["nombre completo", "email", "localidad o provincia"],
+    [],
   );
   assertEquals(
     conversationMissingFields("academia", {
-      name: "Tobias Gómez",
-      email: "tobias@example.com",
-      locality: "La Plata",
+      name: null,
+      email: null,
+      locality: null,
     }),
     [],
   );
@@ -126,6 +126,16 @@ Deno.test("acepta un nombre completo escrito como respuesta directa", () => {
     "Tobias Fernando Bordón",
   );
   assertEquals(patch.name, "Tobias Fernando Bordón");
+});
+
+Deno.test("recupera el nombre completo desde todo el historial y reemplaza el nombre de perfil", () => {
+  const patch = safeAgentPatch(
+    { name: "Mauro", agent_state: {} },
+    { name: "Mauro David Rodríguez" },
+    "academia",
+    "Capacitación\nMauro David Rodríguez\nmaurodavidrodriguez@hotmail.com.ar",
+  );
+  assertEquals(patch.name, "Mauro David Rodríguez");
 });
 
 Deno.test("recupera datos explícitos antiguos aunque hayan quedado fuera del estado del agente", () => {

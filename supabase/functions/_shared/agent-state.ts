@@ -188,17 +188,7 @@ export function conversationMissingFields(
   category: AgentCategory,
   contact: Record<string, any>,
 ): string[] {
-  if (category === "academia") {
-    const missing: string[] = [];
-    if (!hasFullName(contact.name)) missing.push("nombre completo");
-    if (!contact.email) missing.push("email");
-    if (!contact.locality && !contact.province) missing.push("localidad o provincia");
-    const state = stateOf(contact);
-    const skipped = new Set(
-      Array.isArray(state.skipped_fields) ? state.skipped_fields.map((field: unknown) => String(field)) : [],
-    );
-    return missing.filter((field) => !skipped.has(field));
-  }
+  if (category === "academia") return [];
   return quoteMissingFields(contact);
 }
 
@@ -236,7 +226,9 @@ export function safeAgentPatch(
     }
     if (
       key === "name" && hasFullName(fields[key]) && !hasFullName(current) &&
-      explicitFullName(evidence, "nombre completo") === fields[key]
+      evidence.toLocaleLowerCase("es").replace(/\s+/g, " ").includes(
+        String(fields[key]).toLocaleLowerCase("es").replace(/\s+/g, " "),
+      )
     ) {
       patch[key] = fields[key];
       nextExtracted[key] = fields[key];

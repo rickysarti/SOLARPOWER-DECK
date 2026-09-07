@@ -507,10 +507,11 @@ async function modelDecision(
     }
   }
   console.error("agent model response rejected; handing conversation to a human", lastError);
-  return uncertaintyHandoffDecision(category);
+  return uncertaintyHandoffDecision(category, lastError);
 }
 
-export function uncertaintyHandoffDecision(category: AgentCategory): AgentDecision {
+export function uncertaintyHandoffDecision(category: AgentCategory, diagnostic = ""): AgentDecision {
+  const diagnosticSuffix = diagnostic ? `: ${diagnostic.slice(0, 500)}` : "";
   return {
     reply:
       "Gracias por explicarlo. Para no hacerte repetir información ni interpretar mal tu caso, voy a pasar la conversación al equipo para que continúe personalmente por este medio.",
@@ -519,8 +520,26 @@ export function uncertaintyHandoffDecision(category: AgentCategory): AgentDecisi
     missingFields: [],
     completeForQuote: false,
     handoff: true,
-    handoffReason: "El asistente no pudo determinar una respuesta segura con suficiente confianza",
+    handoffReason:
+      `El asistente no pudo determinar una respuesta segura con suficiente confianza${diagnosticSuffix}`,
     label: "Revisión humana",
+  };
+}
+
+export function academyCompletionDecision(contact: ContactPromptData): AgentDecision {
+  const firstName = String(contact.name ?? "").trim().split(/\s+/)[0];
+  const thanks = firstName ? `Gracias, ${firstName}.` : "Gracias.";
+  const channel = contact.email ? "por email" : "por este medio";
+  return {
+    reply:
+      `${thanks} La Academia Solar está en preparación; estamos terminando de armar los contenidos y la modalidad. Ya registramos tu interés y te vamos a avisar ${channel} cuando haya novedades.`,
+    classification: "academia",
+    fields: {},
+    missingFields: [],
+    completeForQuote: false,
+    handoff: false,
+    handoffReason: null,
+    label: "Academia Solar",
   };
 }
 
@@ -723,8 +742,14 @@ async function processInbound(phone: string): Promise<void> {
         contact.label === "Pendiente enviar presupuesto";
       const pendingQuoteFollowup = quoteAlreadyQueued && isQuoteStatusFollowup(incoming);
       const academyAlreadyQueued = contact.label === "Academia Solar" && contact.notified_ricardo === true;
-      const decision = pendingQuoteFollowup
-        ? {
+      const academyReady = category === "academia" &&
+        conversationMissingFields(category, contact).length === 0;
+      const deterministic = deterministicDecision(incoming, category, isFirstConversation);
+      let decisionSource = "claude";
+      let decision: AgentDecision;
+      if (pendingQuoteFollowup) {
+        decisionSource = "deterministic-quote-followup-v7";
+        decision = {
           reply:
             "Disculpá la demora. Veo que tu propuesta sigue pendiente. Ya dejé el reclamo al equipo para que revise el estado y continúe personalmente por este medio.",
           classification: category,
@@ -734,14 +759,19 @@ async function processInbound(phone: string): Promise<void> {
           handoff: true,
           handoffReason: "El cliente reclamó una propuesta pendiente",
           label: "Reclamo presupuesto pendiente",
-        } satisfies AgentDecision
-        : deterministicDecision(incoming, category, isFirstConversation) ??
-          await modelDecision(
-            contact,
-            category,
-            history,
-            incoming,
-          );
+        };
+      } else if (deterministic) {
+        decisionSource = "deterministic-policy-v7";
+        decision = deterministic;
+      } else if (academyReady && !academyAlreadyQueued) {
+        decisionSource = "deterministic-academy-v7";
+        decision = academyCompletionDecision(contact);
+      } else {
+        decision = await modelDecision(contact, category, history, incoming);
+        if (decision.handoffReason?.startsWith("El asistente no pudo determinar")) {
+          decisionSource = "deterministic-uncertainty-v7";
+        }
+      }
       category = decision.classification;
       const storedChargerScope = contact.agent_state?.charger_scope;
       const effectiveChargerScope = chargerScope ??
@@ -776,7 +806,7 @@ async function processInbound(phone: string): Promise<void> {
       const needsFollowup = decision.handoff || chargerOnly ||
         ["cv", "soporte"].includes(category) || academyComplete || completeForQuote;
       const statePatch: Record<string, unknown> = {
-        agent_state: { missing_fields: missing, last_decision_version: "v6" },
+        agent_state: { missing_fields: missing, last_decision_version: "v7" },
       };
       let taskTitle: string | null = null;
       let taskDescription: string | null = null;
@@ -815,9 +845,7 @@ async function processInbound(phone: string): Promise<void> {
       } else if (academyComplete && !academyAlreadyQueued) {
         statePatch.label = "Academia Solar";
         statePatch.notified_ricardo = true;
-        ({ title: taskTitle, description: taskDescription } = taskFor(category, false, contact));
-        responseText =
-          "Perfecto, ya registramos tu interés en la Academia Solar. Te vamos a contactar por email cuando haya novedades.";
+        responseText = academyCompletionDecision(contact).reply;
       } else if ((completeForQuote && quoteAlreadyQueued) || (academyComplete && academyAlreadyQueued)) {
         statePatch.notified_ricardo = true;
         responseText = decision.reply;
@@ -843,7 +871,9 @@ async function processInbound(phone: string): Promise<void> {
         taskTitle,
         taskDescription,
       });
-      responseModel = await runtimeSecret("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001";
+      responseModel = decisionSource === "claude"
+        ? await runtimeSecret("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001"
+        : decisionSource;
     }
 
     responseText = sanitizePlainText(

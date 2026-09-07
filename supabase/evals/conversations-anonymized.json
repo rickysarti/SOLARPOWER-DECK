@@ -13,8 +13,8 @@
     "period": "pre_august",
     "incoming": "Quería consultar por el curso de instalación de paneles solares",
     "expectedCategory": "academia",
-    "expectedHandoff": true,
-    "mustContain": ["Academia"],
+    "expectedHandoff": false,
+    "mustContain": ["Academia", "preparación"],
     "mustNotContain": ["precio confirmado", "fecha confirmada"]
   },
   {
@@ -49,8 +49,8 @@
     "period": "august",
     "incoming": "Estoy interesado en el curso, ¿pueden enviarme información?",
     "expectedCategory": "academia",
-    "expectedHandoff": true,
-    "mustContain": ["Academia"],
+    "expectedHandoff": false,
+    "mustContain": ["Academia", "preparación"],
     "mustNotContain": ["empieza el", "cuesta"]
   },
   {

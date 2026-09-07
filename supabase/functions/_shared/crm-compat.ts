@@ -77,6 +77,34 @@ export async function applyContactState(input: {
   return data as Record<string, any> & { phone: string };
 }
 
+export type CrmConversationMessage = {
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
+};
+
+export async function readCrmConversationHistory(
+  phone: string,
+  limit = 160,
+): Promise<CrmConversationMessage[]> {
+  const conversations = await db().from("chatbot_conversations").select("id")
+    .eq("contact_phone", phone).eq("channel", "whatsapp").order("created_at", { ascending: false })
+    .limit(25);
+  if (conversations.error) throw conversations.error;
+  const conversationIds = (conversations.data ?? []).map((row) => String(row.id)).filter(Boolean);
+  if (!conversationIds.length) return [];
+
+  const messages = await db().from("chatbot_messages").select("role,content,created_at")
+    .in("conversation_id", conversationIds).in("role", ["user", "assistant"])
+    .order("created_at", { ascending: false }).limit(Math.max(1, Math.min(limit, 500)));
+  if (messages.error) throw messages.error;
+  return (messages.data ?? []).reverse().map((row) => ({
+    role: row.role as "user" | "assistant",
+    content: String(row.content ?? ""),
+    created_at: String(row.created_at ?? ""),
+  })).filter((row) => row.content.trim());
+}
+
 async function conversationId(phone: string, name: string | null): Promise<string> {
   const { data: existing, error } = await db().from("chatbot_conversations").select("id")
     .eq("contact_phone", phone).eq("channel", "whatsapp").order("created_at", { ascending: false }).limit(1)

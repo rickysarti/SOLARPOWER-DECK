@@ -75,6 +75,69 @@ export function explicitAgentFields(
   const name = explicitFullName(incoming, expectedField);
   if (name) fields.name = name;
 
+  const email = incoming.match(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i)?.[0];
+  if (email) fields.email = email.toLowerCase();
+
+  const numberValue = (value: string): number => Number(value.replace(/\./g, "").replace(",", "."));
+  const annual = incoming.match(/\b([0-9][0-9.,]*)\s*kwh\s*(?:\/|por\s+)?\s*(?:a[nñ]o|anual(?:es)?)\b/i);
+  const monthly = incoming.match(/\b([0-9][0-9.,]*)\s*kwh\s*(?:\/|por\s+)?\s*(?:mes|mensual(?:es)?)\b/i) ??
+    (expectedField === "factura, consumo o lista de cargas"
+      ? incoming.match(/\b([0-9][0-9.,]*)\s*kwh\b/i)
+      : null);
+  if (annual) {
+    const value = numberValue(annual[1]);
+    if (Number.isFinite(value) && value > 0) fields.consumo_anual = value;
+  }
+  if (monthly) {
+    const value = numberValue(monthly[1]);
+    if (Number.isFinite(value) && value > 0) fields.consumo_mensual = value;
+  }
+
+  const provinceMatchers: Array<[string, RegExp]> = [
+    ["Buenos Aires", /\b(?:buenos aires|bs\.?\s*as\.?)\b/i],
+    ["Catamarca", /\bcatamarca\b/i],
+    ["Chaco", /\bchaco\b/i],
+    ["Chubut", /\bchubut\b/i],
+    ["Córdoba", /\bc[oó]rdoba\b/i],
+    ["Corrientes", /\bcorrientes\b/i],
+    ["Entre Ríos", /\bentre r[ií]os\b/i],
+    ["Formosa", /\bformosa\b/i],
+    ["Jujuy", /\bjujuy\b/i],
+    ["La Pampa", /\bla pampa\b/i],
+    ["La Rioja", /\bla rioja\b/i],
+    ["Mendoza", /\bmendoza\b/i],
+    ["Misiones", /\bmisiones\b/i],
+    ["Neuquén", /\bneuqu[eé]n\b/i],
+    ["Río Negro", /\br[ií]o negro\b/i],
+    ["Salta", /\bsalta\b/i],
+    ["San Juan", /\bsan juan\b/i],
+    ["San Luis", /\bsan luis\b/i],
+    ["Santa Cruz", /\bsanta cruz\b/i],
+    ["Santa Fe", /\bsanta fe\b/i],
+    ["Santiago del Estero", /\bsantiago del estero\b/i],
+    ["Tierra del Fuego", /\btierra del fuego\b/i],
+    ["Tucumán", /\btucum[aá]n\b/i],
+  ];
+  const province = provinceMatchers.find(([, pattern]) => pattern.test(incoming))?.[0];
+  if (province) fields.province = province;
+  if (/\bneuqu[eé]n\s+capital\b/i.test(incoming)) fields.locality = "Neuquén Capital";
+  if (/\b(?:caba|capital federal|ciudad aut[oó]noma de buenos aires)\b/i.test(incoming)) {
+    fields.locality = "CABA";
+  }
+
+  if (/\b(?:bajar|reducir|ahorrar|ahorro)\b.{0,45}\b(?:costos?|factura|luz|electricidad)\b/i.test(incoming)) {
+    fields.product_interest = "Reducir costos de electricidad";
+  } else if (/\b(?:cortes?|respaldo)\b/i.test(incoming)) {
+    fields.product_interest = "Respaldo ante cortes de energía";
+  }
+  if (
+    expectedField === "necesidad o producto" &&
+    /\b(?:las|ambas|dos)\s+opciones\b|\bcon\s+bater[ií]a\b.{0,60}\b(?:sin|on[ -]?grid)\b|\b(?:sin|on[ -]?grid)\b.{0,60}\bcon\s+bater[ií]a\b/i
+      .test(incoming)
+  ) {
+    fields.product_interest = "Comparar sistema on-grid y sistema con batería";
+  }
+
   const hasChapa = /\bchapa\b/i.test(incoming);
   const hasTeja = /\btejas?\b/i.test(incoming);
   if (hasChapa && hasTeja) {
@@ -100,6 +163,10 @@ export function explicitAgentFields(
   } else if (/\bmonof[aá]sic[ao]\b/i.test(incoming)) {
     fields.connection_type = "monofásica";
   } else if (/\btrif[aá]sic[ao]\b/i.test(incoming)) {
+    fields.connection_type = "trifásica";
+  } else if (expectedField === "tipo de conexión" && /^\s*mono(?:f[aá]sic[ao])?[.!]?\s*$/i.test(incoming)) {
+    fields.connection_type = "monofásica";
+  } else if (expectedField === "tipo de conexión" && /^\s*tri(?:f[aá]sic[ao])?[.!]?\s*$/i.test(incoming)) {
     fields.connection_type = "trifásica";
   }
 
@@ -164,7 +231,9 @@ export function safeAgentPatch(
     if (fields[key] === undefined) continue;
     if (
       key === "connection_type" && evidence &&
-      !/\b(monof[aá]sic[ao]|trif[aá]sic[ao]|sin\s+red|off[ -]?grid|fuera\s+de\s+red)\b/i.test(evidence)
+      !/\b(mono(?:f[aá]sic[ao])?|tri(?:f[aá]sic[ao])?|sin\s+red|off[ -]?grid|fuera\s+de\s+red)\b/i.test(
+        evidence,
+      )
     ) {
       continue;
     }

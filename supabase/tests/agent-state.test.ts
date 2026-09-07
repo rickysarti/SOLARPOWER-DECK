@@ -117,7 +117,9 @@ Deno.test("acepta un nombre completo escrito como respuesta directa", () => {
   assertEquals(explicitAgentFields("Tobias Fernando Bordón", "nombre completo"), {
     name: "Tobias Fernando Bordón",
   });
-  assertEquals(explicitAgentFields("Buenos Aires", "localidad o provincia"), {});
+  assertEquals(explicitAgentFields("Buenos Aires", "localidad o provincia"), {
+    province: "Buenos Aires",
+  });
   const patch = safeAgentPatch(
     { name: "Tobias", agent_state: {} },
     { name: "Tobias Fernando Bordón" },
@@ -125,6 +127,22 @@ Deno.test("acepta un nombre completo escrito como respuesta directa", () => {
     "Tobias Fernando Bordón",
   );
   assertEquals(patch.name, "Tobias Fernando Bordón");
+});
+
+Deno.test("recupera datos explícitos antiguos aunque hayan quedado fuera del estado del agente", () => {
+  assertEquals(explicitAgentFields("Están en Neuquén capital?"), {
+    province: "Neuquén",
+    locality: "Neuquén Capital",
+  });
+  assertEquals(explicitAgentFields("Mono", "tipo de conexión"), {
+    connection_type: "monofásica",
+  });
+  assertEquals(explicitAgentFields("palaganij@hotmail.com"), {
+    email: "palaganij@hotmail.com",
+  });
+  assertEquals(explicitAgentFields("475 kWh", "factura, consumo o lista de cargas"), {
+    consumo_mensual: 475,
+  });
 });
 
 Deno.test("no vuelve a exigir un dato que el cliente decidió definir después", () => {

@@ -10,12 +10,19 @@ import {
   taskFor,
 } from "./agent-state.ts";
 import { authorizedControlCommand, type ControlCommand } from "./control.ts";
-import { applyContactState, ensureCrmContact, syncMessageToCrm } from "./crm-compat.ts";
+import {
+  applyContactState,
+  ensureCrmContact,
+  readCrmConversationHistory,
+  syncMessageToCrm,
+} from "./crm-compat.ts";
 import { maybeSendDailyReport } from "./daily-report.ts";
 import { db, runtimeSecret, setting } from "./db.ts";
 import {
   type AgentCategory,
   type AgentDecision,
+  type AgentFieldUpdates,
+  asksAssistantIdentity,
   chargerScopeFromText,
   isStandaloneLighting,
   parseAgentDecision,
@@ -352,6 +359,19 @@ export function deterministicDecision(
       label: "Solicita representante",
     };
   }
+  if (asksAssistantIdentity(incoming)) {
+    return {
+      reply:
+        "Soy Tomás, el asistente virtual de SolarPower. Estoy acá para ayudarte con tu consulta y registrar la información para el equipo.",
+      classification: category,
+      fields: explicitAgentFields(incoming),
+      missingFields: [],
+      completeForQuote: false,
+      handoff: false,
+      handoffReason: null,
+      label: null,
+    };
+  }
   if (isStandaloneLighting(incoming)) {
     return {
       reply:
@@ -420,6 +440,26 @@ const CONVERSATION_FIELDS = [
   "tipo de conexión",
   "necesidad o producto",
 ] as const;
+
+export function explicitFieldsFromConversation(history: AgentMessage[]): AgentFieldUpdates {
+  const fields: AgentFieldUpdates = {};
+  let expectedField: string | null = null;
+  for (const message of history) {
+    if (message.role === "assistant") {
+      expectedField = CONVERSATION_FIELDS.find((field) => replyRequestsField(message.content, field)) ?? null;
+      continue;
+    }
+    Object.assign(fields, explicitAgentFields(message.content, expectedField));
+  }
+  return fields;
+}
+
+export function isQuoteStatusFollowup(incoming: string): boolean {
+  return /\b(?:no\s+(?:me\s+)?(?:lleg[oó]|llegaron|recib[ií])|todav[ií]a\s+(?:no|nada)|sigo\s+esperando|qued(?:aron|[oó])\s+en\s+(?:enviar|mandar)\w*|alg[uú]n\s+inconveniente|qu[eé]\s+pas[oó])\b/i
+    .test(incoming) ||
+    /\b(?:presupuesto|cotizaci[oó]n|propuestas?)\b.{0,55}\b(?:estado|demora|pendiente|esperando|enviar|mandar|llegar)\w*\b/i
+      .test(incoming);
+}
 
 function previousAssistantReply(history: AgentMessage[]): string | null {
   return [...history].reverse().find((message) => message.role === "assistant")?.content ?? null;
@@ -578,7 +618,7 @@ export function replyRequestsField(reply: string, field: string): boolean {
     "techo o superficie": /\b(techo|superficie|lugar.{0,25}paneles|paneles.{0,25}instalar)/i,
     "tipo de conexión": /\b(conexi[oó]n|monof[aá]sic|trif[aá]sic|sin red|off[ -]?grid)\b/i,
     "necesidad o producto":
-      /\b(ahorro|cortes?|respaldo|independencia|objetivo|motiv|qu[eé] (?:busc[aá]s|quer[eé]s lograr))/i,
+      /\b(ahorro|cortes?|respaldo|independencia|bater[ií]a|on[ -]?grid|sistema solar|objetivo|motiv|qu[eé] (?:busc[aá]s|quer[eé]s lograr))/i,
   };
   return (patterns[field]?.test(reply) ?? true) && reply.includes("?");
 }
@@ -783,19 +823,34 @@ async function processInbound(phone: string): Promise<void> {
       }
 
       const storedContact = contact;
+      const crmHistory = await readCrmConversationHistory(phone, 160);
+      let history = crmHistory.map(({ role, content }) => ({ role, content })) as AgentMessage[];
+      if (!history.length) {
+        const historyResult = await db().from("agent_messages")
+          .select("role,content").eq("contact_phone", phone).order("created_at", { ascending: false }).limit(
+            100,
+          );
+        if (historyResult.error) throw historyResult.error;
+        history = (historyResult.data ?? []).reverse().filter((row) =>
+          row.role !== "system"
+        ) as AgentMessage[];
+      }
+      const historicalFields = explicitFieldsFromConversation(history);
+      const historyEvidence = history.filter((message) => message.role === "user")
+        .map((message) => message.content).join("\n");
       const missingBeforeExplicitExtraction = conversationMissingFields(category, storedContact);
-      const explicitFields = explicitAgentFields(incoming, missingBeforeExplicitExtraction[0] ?? null);
-      const explicitPatch = safeAgentPatch(storedContact, explicitFields, category, incoming);
+      const explicitFields = {
+        ...historicalFields,
+        ...explicitAgentFields(incoming, missingBeforeExplicitExtraction[0] ?? null),
+      };
+      const explicitPatch = safeAgentPatch(
+        storedContact,
+        explicitFields,
+        category,
+        historyEvidence || incoming,
+      );
       contact = contactWithPatch(storedContact, explicitPatch) as typeof contact;
 
-      const historyResult = await db().from("agent_messages")
-        .select("role,content").eq("contact_phone", phone).order("created_at", { ascending: false }).limit(
-          100,
-        );
-      if (historyResult.error) throw historyResult.error;
-      const history = (historyResult.data ?? []).reverse().filter((row) =>
-        row.role !== "system"
-      ) as AgentMessage[];
       const isFirstConversation = !history.some((row) => row.role === "assistant");
       const initialMissing = conversationMissingFields(category, contact);
       const deferredField = deferredRequiredField(incoming, initialMissing[0] ?? null);
@@ -809,9 +864,29 @@ async function processInbound(phone: string): Promise<void> {
       const explicitHumanHandoff = requestsHumanRepresentative(incoming);
       const quoteAlreadyQueued = contact.stage === "pendiente_presupuesto" ||
         contact.label === "Pendiente enviar presupuesto";
+      const pendingQuoteFollowup = quoteAlreadyQueued && isQuoteStatusFollowup(incoming);
       const academyAlreadyQueued = contact.label === "Academia Solar" && contact.notified_ricardo === true;
-      const decision = deterministicDecision(incoming, category, isFirstConversation) ??
-        await modelDecision(contact, category, modelMissing, history, incoming, repeatedQuestionField);
+      const decision = pendingQuoteFollowup
+        ? {
+          reply:
+            "Disculpá la demora. Veo que tu propuesta sigue pendiente. Ya dejé el reclamo al equipo para que revise el estado y continúe personalmente por este medio.",
+          classification: category,
+          fields: {},
+          missingFields: [],
+          completeForQuote: false,
+          handoff: true,
+          handoffReason: "El cliente reclamó una propuesta pendiente",
+          label: "Reclamo presupuesto pendiente",
+        } satisfies AgentDecision
+        : deterministicDecision(incoming, category, isFirstConversation) ??
+          await modelDecision(
+            contact,
+            category,
+            quoteAlreadyQueued ? [] : modelMissing,
+            history,
+            incoming,
+            quoteAlreadyQueued ? null : repeatedQuestionField,
+          );
       category = decision.classification;
       const storedChargerScope = contact.agent_state?.charger_scope;
       const effectiveChargerScope = chargerScope ??
@@ -833,7 +908,7 @@ async function processInbound(phone: string): Promise<void> {
           ...(effectiveChargerScope ? { charger_scope: effectiveChargerScope } : {}),
         },
         category,
-        incoming,
+        historyEvidence || incoming,
       );
       if (deferredField) {
         const skipped = new Set<string>(
@@ -858,11 +933,18 @@ async function processInbound(phone: string): Promise<void> {
       const needsFollowup = decision.handoff || chargerOnly ||
         ["cv", "soporte"].includes(category) || academyComplete || completeForQuote;
       const statePatch: Record<string, unknown> = {
-        agent_state: { missing_fields: missing, last_decision_version: "v3" },
+        agent_state: { missing_fields: missing, last_decision_version: "v5" },
       };
       let taskTitle: string | null = null;
       let taskDescription: string | null = null;
-      if (explicitHumanHandoff) {
+      if (pendingQuoteFollowup) {
+        statePatch.human_mode = true;
+        statePatch.label = "Reclamo presupuesto pendiente";
+        statePatch.notified_ricardo = true;
+        taskTitle = "Revisar presupuesto pendiente";
+        taskDescription = "El cliente informó que todavía no recibió la propuesta prometida.";
+        responseText = decision.reply;
+      } else if (explicitHumanHandoff) {
         statePatch.human_mode = true;
         statePatch.label = "Solicita representante";
         statePatch.notified_ricardo = true;

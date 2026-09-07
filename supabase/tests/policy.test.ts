@@ -1,4 +1,5 @@
 import {
+  asksAssistantIdentity,
   chargerScopeFromText,
   isStandaloneLighting,
   parseAgentDecision,
@@ -9,7 +10,9 @@ import { hasForbiddenFormatting, sanitizePlainText } from "../functions/_shared/
 import { agentSystemPrompt } from "../functions/_shared/prompts.ts";
 import {
   deterministicDecision,
+  explicitFieldsFromConversation,
   fallbackContinuation,
+  isQuoteStatusFollowup,
   nextRequiredField,
   previouslyRequestedMissingField,
   repeatedAssistantQuestionField,
@@ -48,6 +51,48 @@ Deno.test("una solicitud de representante tiene prioridad sobre los datos pendie
   assertEquals(decision?.handoff, true);
   assertEquals(decision?.label, "Solicita representante");
   assert(!decision?.reply.includes("techo"));
+});
+
+Deno.test("responde quién es sin reiniciar el cuestionario", () => {
+  assert(asksAssistantIdentity("Con quien estoy hablando?"));
+  const decision = deterministicDecision("Quién sos?", "residencial", false);
+  assert(decision?.reply.startsWith("Soy Tomás"));
+  assertEquals(decision?.handoff, false);
+  assertEquals((decision?.reply.match(/\?/g) ?? []).length, 0);
+});
+
+Deno.test("un reclamo de presupuesto pendiente activa el seguimiento", () => {
+  assert(isQuoteStatusFollowup("Buenas tardes. Algún inconveniente? No recibí nada todavía!"));
+  assert(isQuoteStatusFollowup("Quedaron en mandarme las dos propuestas"));
+  assertEquals(isQuoteStatusFollowup("Tengo techo de teja"), false);
+});
+
+Deno.test("reconstruye el contexto de toda la conversación anterior", () => {
+  const fields = explicitFieldsFromConversation([
+    { role: "user", content: "Ver opciones de bajar costos. Están en Neuquén capital?" },
+    { role: "assistant", content: "¿Qué tipo de techo tenés: chapa, tejas, losa o membrana?" },
+    { role: "user", content: "Teja" },
+    { role: "assistant", content: "¿Tu conexión eléctrica es monofásica o trifásica?" },
+    { role: "user", content: "Mono" },
+    {
+      role: "assistant",
+      content: "¿Te gustaría que la propuesta incluya batería o preferís solo el sistema solar sin ella?",
+    },
+    { role: "user", content: "Preparar las dos opciones, y vemos." },
+    { role: "assistant", content: "¿Me decís tu nombre completo?" },
+    { role: "user", content: "Juan Carlos Palagani." },
+    { role: "assistant", content: "¿Cuál es tu email?" },
+    { role: "user", content: "palaganij@hotmail.com" },
+  ]);
+  assertEquals(fields, {
+    province: "Neuquén",
+    locality: "Neuquén Capital",
+    product_interest: "Comparar sistema on-grid y sistema con batería",
+    roof_type: "Techo de tejas",
+    connection_type: "monofásica",
+    name: "Juan Carlos Palagani",
+    email: "palaganij@hotmail.com",
+  });
 });
 
 Deno.test("detecta una respuesta exactamente repetida", () => {
@@ -202,6 +247,7 @@ Deno.test("todos los prompts incluyen la política compartida de cargadores y se
     assert(prompt.includes("todo el país"));
     assert(prompt.includes("no vende ni instala luminarias"));
     assert(prompt.includes("una sola pregunta"));
+    assert(prompt.includes("presupuesto pendiente"));
   }
 });
 

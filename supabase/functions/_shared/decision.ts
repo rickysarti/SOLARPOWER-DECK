@@ -165,6 +165,11 @@ export function requestsHumanRepresentative(incoming: string): boolean {
       .test(incoming);
 }
 
+export function asksAssistantIdentity(incoming: string): boolean {
+  return /\b(?:con\s+qui[eé]n|qui[eé]n)\s+(?:estoy\s+)?(?:hablando|hablo)|\bqui[eé]n\s+(?:sos|eres)\b/i
+    .test(incoming);
+}
+
 export function chargerScopeFromText(incoming: string): AgentFieldUpdates["charger_scope"] | null {
   if (!/\b(cargador|carga).{0,20}\b(el[eé]ctric|veh[ií]culo|auto)|\bwallbox\b/i.test(incoming)) return null;
   if (

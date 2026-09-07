@@ -6,7 +6,7 @@ import {
   type SendPulseChat,
   type SendPulseChatMessage,
 } from "./sendpulse.ts";
-import { enqueuePhone, recordWebhookReceipt } from "./webhook.ts";
+import { cancelPendingCustomerReplies, enqueuePhone, recordWebhookReceipt } from "./webhook.ts";
 
 type ExistingInbound = {
   provider_message_id: string;
@@ -251,7 +251,10 @@ export async function reconcileSendPulseInbound(): Promise<ReconciliationResult>
       recoveredMessages += 1;
     }
   }
-  for (const phone of phones) await enqueuePhone(phone, 0);
+  for (const phone of phones) {
+    await cancelPendingCustomerReplies(phone);
+    await enqueuePhone(phone);
+  }
   return {
     scannedChats: chats.length,
     candidateChats: recent.length,

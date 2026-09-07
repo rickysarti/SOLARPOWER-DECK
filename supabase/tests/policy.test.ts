@@ -11,6 +11,8 @@ import {
   deterministicDecision,
   fallbackContinuation,
   nextRequiredField,
+  previouslyRequestedMissingField,
+  repeatedAssistantQuestionField,
   repeatsPreviousAssistantReply,
   replyRequestsField,
 } from "../functions/_shared/processor.ts";
@@ -19,6 +21,7 @@ import {
   isInboundSendPulseMessage,
   sendPulseMessageContent,
 } from "../functions/_shared/sendpulse-reconcile.ts";
+import { inboundDebounceRemainingSeconds } from "../functions/_shared/webhook.ts";
 import { assert, assertEquals } from "./assert.ts";
 
 Deno.test("sanitiza emojis, asteriscos y markdown", () => {
@@ -60,6 +63,37 @@ Deno.test("detecta una respuesta exactamente repetida", () => {
     ]),
     false,
   );
+});
+
+Deno.test("detecta preguntas reformuladas que vuelven a pedir el mismo dato", () => {
+  const history = [
+    {
+      role: "assistant" as const,
+      content: "¿Tenés una factura, un consumo aproximado en kWh o una lista de equipos?",
+    },
+    { role: "user" as const, content: "Quiero ser totalmente independiente de la red" },
+  ];
+  const reformulated =
+    "Entendido. Para diseñarlo, ¿podés estimar cuántos kWh consumís mensualmente en tu vivienda?";
+  assertEquals(
+    repeatedAssistantQuestionField(reformulated, history),
+    "factura, consumo o lista de cargas",
+  );
+  assertEquals(
+    previouslyRequestedMissingField(
+      ["factura, consumo o lista de cargas", "techo o superficie"],
+      history,
+    ),
+    "factura, consumo o lista de cargas",
+  );
+});
+
+Deno.test("el debounce vence un minuto después del último mensaje", () => {
+  const receivedAt = "2026-09-07T18:40:13.000Z";
+  const receivedAtMs = new Date(receivedAt).getTime();
+  assertEquals(inboundDebounceRemainingSeconds(receivedAt, receivedAtMs), 60);
+  assertEquals(inboundDebounceRemainingSeconds(receivedAt, receivedAtMs + 21_000), 39);
+  assertEquals(inboundDebounceRemainingSeconds(receivedAt, receivedAtMs + 60_000), 0);
 });
 
 Deno.test("valida AgentDecision y rechaza respuestas impropias", () => {

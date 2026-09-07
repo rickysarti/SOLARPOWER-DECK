@@ -2,7 +2,14 @@ import { db, json, runtimeSecret } from "../_shared/db.ts";
 import { errorMessage } from "../_shared/errors.ts";
 import { normalizePhone, verifyMetaSignature } from "../_shared/meta.ts";
 import { processDueJobs } from "../_shared/processor.ts";
-import { enqueuePhone, payloadHash, recordWebhookError, recordWebhookReceipt } from "../_shared/webhook.ts";
+import {
+  cancelPendingCustomerReplies,
+  enqueuePhone,
+  INBOUND_DEBOUNCE_SECONDS,
+  payloadHash,
+  recordWebhookError,
+  recordWebhookReceipt,
+} from "../_shared/webhook.ts";
 
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
 
@@ -140,10 +147,13 @@ async function processWebhook(
     }
   }
 
-  for (const phone of phones) await enqueuePhone(phone, 5);
+  for (const phone of phones) {
+    await cancelPendingCustomerReplies(phone);
+    await enqueuePhone(phone);
+  }
   if (phones.size) {
     EdgeRuntime.waitUntil((async () => {
-      await new Promise((resolve) => setTimeout(resolve, 6_000));
+      await new Promise((resolve) => setTimeout(resolve, (INBOUND_DEBOUNCE_SECONDS + 1) * 1000));
       try {
         await processDueJobs(Math.max(phones.size, 10));
       } catch (error) {

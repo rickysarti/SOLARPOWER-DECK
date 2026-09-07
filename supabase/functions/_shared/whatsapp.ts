@@ -13,11 +13,20 @@ type OutboundRow = {
   phone: string;
   content: string;
   provider: string;
+  kind: string;
   status: string;
   attempts: number;
   provider_message_id: string | null;
+  created_at: string;
   metadata?: Record<string, unknown> | null;
 };
+
+export class CustomerReplySupersededError extends Error {
+  constructor() {
+    super("Customer reply was superseded by a newer inbound message");
+    this.name = "CustomerReplySupersededError";
+  }
+}
 
 export type PreparedWhatsAppText = {
   content: string;
@@ -59,9 +68,40 @@ async function deliverRow(row: OutboundRow): Promise<string> {
     if (current.data.provider_message_id && ["sent", "delivered", "read"].includes(current.data.status)) {
       return current.data.provider_message_id;
     }
+    if (row.kind === "customer_reply" && current.data.status === "cancelled") {
+      throw new CustomerReplySupersededError();
+    }
     throw new Error("Outbound message is already being delivered");
   }
   try {
+    if (row.kind === "customer_reply") {
+      const inboundIds = new Set(
+        Array.isArray(row.metadata?.inbound_event_ids)
+          ? row.metadata.inbound_event_ids.map((id) => String(id))
+          : [],
+      );
+      const inbound = await db().from("agent_inbound_events")
+        .select("id,received_at,processed_at").eq("phone", row.phone)
+        .order("received_at", { ascending: false }).limit(200);
+      if (inbound.error) throw inbound.error;
+      const superseded = (inbound.data ?? []).some((event) =>
+        !inboundIds.has(String(event.id)) &&
+        (event.processed_at === null ||
+          new Date(event.received_at).getTime() > new Date(row.created_at).getTime())
+      );
+      if (superseded) {
+        const cancelled = await db().from("agent_outbound_messages").update({
+          status: "cancelled",
+          error: "Superseded by a newer inbound message",
+          updated_at: new Date().toISOString(),
+        }).eq("id", row.id).eq("status", "sending");
+        if (cancelled.error) throw cancelled.error;
+        throw new CustomerReplySupersededError();
+      }
+      const current = await db().from("agent_outbound_messages").select("status").eq("id", row.id).single();
+      if (current.error) throw current.error;
+      if (current.data.status === "cancelled") throw new CustomerReplySupersededError();
+    }
     const messageId = row.provider === "meta"
       ? await sendMetaText(row.phone, row.content)
       : await sendSendPulseChunk(row.phone, row.content);
@@ -74,6 +114,7 @@ async function deliverRow(row: OutboundRow): Promise<string> {
     }).eq("id", row.id);
     return messageId;
   } catch (sendError) {
+    if (sendError instanceof CustomerReplySupersededError) throw sendError;
     const terminal = attempts >= 5;
     await db().from("agent_outbound_messages").update({
       status: "failed",
@@ -195,7 +236,8 @@ export async function retryDueOutboundMessages(limit = 20): Promise<{ sent: numb
     try {
       await deliverRow(row);
       sent += 1;
-    } catch {
+    } catch (error) {
+      if (error instanceof CustomerReplySupersededError) continue;
       failed += 1;
     }
   }

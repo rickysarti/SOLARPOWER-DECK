@@ -1,6 +1,17 @@
 import { db } from "./db.ts";
 import { errorMessage } from "./errors.ts";
 
+export const INBOUND_DEBOUNCE_SECONDS = 60;
+
+export function inboundDebounceRemainingSeconds(
+  receivedAt: string,
+  now = Date.now(),
+): number {
+  const receivedAtMs = new Date(receivedAt).getTime();
+  if (!Number.isFinite(receivedAtMs)) return INBOUND_DEBOUNCE_SECONDS;
+  return Math.max(0, Math.ceil((receivedAtMs + INBOUND_DEBOUNCE_SECONDS * 1000 - now) / 1000));
+}
+
 function hex(bytes: ArrayBuffer): string {
   return Array.from(new Uint8Array(bytes)).map((value) => value.toString(16).padStart(2, "0")).join("");
 }
@@ -32,10 +43,22 @@ export async function recordWebhookReceipt(input: {
   if (inserted.error) throw inserted.error;
 }
 
-export async function enqueuePhone(phone: string, delaySeconds = 20): Promise<string> {
+export async function enqueuePhone(
+  phone: string,
+  delaySeconds = INBOUND_DEBOUNCE_SECONDS,
+): Promise<string> {
   const queued = await db().rpc("agent_enqueue_phone", { p_phone: phone, p_delay_seconds: delaySeconds });
   if (queued.error) throw queued.error;
   return String(queued.data);
+}
+
+export async function cancelPendingCustomerReplies(phone: string): Promise<void> {
+  const cancelled = await db().from("agent_outbound_messages").update({
+    status: "cancelled",
+    error: "Superseded by a newer inbound message",
+    updated_at: new Date().toISOString(),
+  }).eq("phone", phone).eq("kind", "customer_reply").in("status", ["pending", "failed", "sending"]);
+  if (cancelled.error) throw cancelled.error;
 }
 
 export async function recordWebhookError(

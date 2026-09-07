@@ -28,12 +28,14 @@ import { sanitizePlainText } from "./output.ts";
 import { agentSystemPrompt, type ContactPromptData } from "./prompts.ts";
 import { reconcileSendPulseInbound } from "./sendpulse-reconcile.ts";
 import {
+  CustomerReplySupersededError,
   downloadWhatsAppMedia,
   preparedWhatsAppText,
   retryDueOutboundMessages,
   sendWhatsAppText,
 } from "./whatsapp.ts";
 import { askClaude } from "./anthropic.ts";
+import { enqueuePhone, inboundDebounceRemainingSeconds } from "./webhook.ts";
 
 type Job = {
   id: string;
@@ -409,14 +411,63 @@ export function repeatsPreviousAssistantReply(reply: string, history: AgentMessa
   );
 }
 
+const CONVERSATION_FIELDS = [
+  "nombre completo",
+  "email",
+  "localidad o provincia",
+  "factura, consumo o lista de cargas",
+  "techo o superficie",
+  "tipo de conexión",
+  "necesidad o producto",
+] as const;
+
+function previousAssistantReply(history: AgentMessage[]): string | null {
+  return [...history].reverse().find((message) => message.role === "assistant")?.content ?? null;
+}
+
+export function repeatedAssistantQuestionField(
+  reply: string,
+  history: AgentMessage[],
+): string | null {
+  const previous = previousAssistantReply(history);
+  if (!previous) return null;
+  return CONVERSATION_FIELDS.find((field) =>
+    replyRequestsField(reply, field) && replyRequestsField(previous, field)
+  ) ?? null;
+}
+
+export function previouslyRequestedMissingField(
+  missing: string[],
+  history: AgentMessage[],
+): string | null {
+  const previous = previousAssistantReply(history);
+  if (!previous) return null;
+  return missing.find((field) => replyRequestsField(previous, field)) ?? null;
+}
+
 async function modelDecision(
   contact: ContactPromptData,
   category: AgentCategory,
   missing: string[],
   history: AgentMessage[],
   incoming: string,
+  doNotRepeatField: string | null = null,
 ): Promise<AgentDecision> {
-  let correction: string | undefined;
+  if (doNotRepeatField && missing.length === 0) {
+    return {
+      reply: "Perfecto, tomo esta aclaración y dejo actualizado lo que ya me contaste.",
+      classification: category,
+      fields: explicitFallbackFields(incoming),
+      missingFields: [doNotRepeatField],
+      completeForQuote: false,
+      handoff: false,
+      handoffReason: null,
+      label: null,
+    };
+  }
+  let correction = doNotRepeatField
+    ? `El mensaje anterior del asistente ya preguntó por ${doNotRepeatField}. No vuelvas a pedirlo ni lo reformules en esta respuesta. Tomá la nueva información y avanzá con otro dato faltante; si no hay otro, respondé sólo con un acuse breve, sin pregunta ni cierre del relevamiento.`
+    : undefined;
   let lastError = "";
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -425,6 +476,10 @@ async function modelDecision(
       const violations = replyViolations(decision.reply, incoming);
       if (repeatsPreviousAssistantReply(decision.reply, history)) {
         violations.push("repite exactamente la respuesta anterior");
+      }
+      const repeatedQuestion = repeatedAssistantQuestionField(decision.reply, history);
+      if (repeatedQuestion) {
+        violations.push(`repite la pregunta anterior sobre ${repeatedQuestion}`);
       }
       const requiredField = nextRequiredField(missing, decision.fields);
       if (
@@ -448,6 +503,40 @@ async function modelDecision(
   }
   console.error("agent model response rejected; using deterministic continuation", lastError);
   return fallbackContinuation(contact, category, missing, incoming);
+}
+
+function contactWithPatch(
+  contact: ContactPromptData,
+  patch: Record<string, unknown>,
+): ContactPromptData {
+  const currentState = contact.agent_state && typeof contact.agent_state === "object"
+    ? contact.agent_state
+    : {};
+  const patchState = patch.agent_state && typeof patch.agent_state === "object"
+    ? patch.agent_state as Record<string, unknown>
+    : {};
+  return { ...contact, ...patch, agent_state: { ...currentState, ...patchState } };
+}
+
+function mergeContactPatches(
+  first: Record<string, unknown>,
+  second: Record<string, unknown>,
+): Record<string, unknown> {
+  const firstState = first.agent_state && typeof first.agent_state === "object"
+    ? first.agent_state as Record<string, unknown>
+    : {};
+  const secondState = second.agent_state && typeof second.agent_state === "object"
+    ? second.agent_state as Record<string, unknown>
+    : {};
+  return { ...first, ...second, agent_state: { ...firstState, ...secondState } };
+}
+
+async function hasUnbatchedInbound(phone: string, batchIds: string[]): Promise<boolean> {
+  const pending = await db().from("agent_inbound_events").select("id")
+    .eq("phone", phone).is("processed_at", null).limit(Math.min(batchIds.length + 1, 1000));
+  if (pending.error) throw pending.error;
+  const batch = new Set(batchIds);
+  return (pending.data ?? []).some((event) => !batch.has(String(event.id)));
 }
 
 function fieldResolved(field: string, fields: AgentDecision["fields"]): boolean {
@@ -579,10 +668,16 @@ export function fallbackContinuation(
 
 async function processInbound(phone: string): Promise<void> {
   const eventsResult = await db().from("agent_inbound_events")
-    .select("*").eq("phone", phone).is("processed_at", null).order("received_at").limit(20);
+    .select("*").eq("phone", phone).is("processed_at", null).order("received_at");
   if (eventsResult.error) throw eventsResult.error;
   let events = eventsResult.data ?? [];
   if (!events.length) return;
+  const latestReceivedAt = events.reduce(
+    (latest, event) =>
+      new Date(event.received_at).getTime() > new Date(latest).getTime() ? String(event.received_at) : latest,
+    String(events[0].received_at),
+  );
+  if (inboundDebounceRemainingSeconds(latestReceivedAt) > 0) return;
   const allIds = events.map((event) => event.id);
   try {
     const admins = await internalPhoneSet();
@@ -687,18 +782,15 @@ async function processInbound(phone: string): Promise<void> {
         category = chargerScope ? "cargador_electrico" : await classifyContact(incoming);
       }
 
-      const missingBeforeExplicitExtraction = conversationMissingFields(category, contact);
+      const storedContact = contact;
+      const missingBeforeExplicitExtraction = conversationMissingFields(category, storedContact);
       const explicitFields = explicitAgentFields(incoming, missingBeforeExplicitExtraction[0] ?? null);
-      if (Object.keys(explicitFields).length) {
-        contact = await applyContactState({
-          phone,
-          patch: safeAgentPatch(contact, explicitFields, category, incoming),
-        });
-      }
+      const explicitPatch = safeAgentPatch(storedContact, explicitFields, category, incoming);
+      contact = contactWithPatch(storedContact, explicitPatch) as typeof contact;
 
       const historyResult = await db().from("agent_messages")
         .select("role,content").eq("contact_phone", phone).order("created_at", { ascending: false }).limit(
-          40,
+          100,
         );
       if (historyResult.error) throw historyResult.error;
       const history = (historyResult.data ?? []).reverse().filter((row) =>
@@ -710,12 +802,16 @@ async function processInbound(phone: string): Promise<void> {
       const decisionMissing = deferredField
         ? initialMissing.filter((field) => field !== deferredField)
         : initialMissing;
+      const repeatedQuestionField = previouslyRequestedMissingField(decisionMissing, history);
+      const modelMissing = repeatedQuestionField
+        ? decisionMissing.filter((field) => field !== repeatedQuestionField)
+        : decisionMissing;
       const explicitHumanHandoff = requestsHumanRepresentative(incoming);
       const quoteAlreadyQueued = contact.stage === "pendiente_presupuesto" ||
         contact.label === "Pendiente enviar presupuesto";
       const academyAlreadyQueued = contact.label === "Academia Solar" && contact.notified_ricardo === true;
       const decision = deterministicDecision(incoming, category, isFirstConversation) ??
-        await modelDecision(contact, category, decisionMissing, history, incoming);
+        await modelDecision(contact, category, modelMissing, history, incoming, repeatedQuestionField);
       category = decision.classification;
       const storedChargerScope = contact.agent_state?.charger_scope;
       const effectiveChargerScope = chargerScope ??
@@ -730,7 +826,7 @@ async function processInbound(phone: string): Promise<void> {
         category = "cargador_electrico";
       }
       const patch = safeAgentPatch(
-        contact,
+        storedContact,
         {
           ...decision.fields,
           ...explicitFields,
@@ -752,7 +848,7 @@ async function processInbound(phone: string): Promise<void> {
         };
       }
       if (decision.label) patch.label = decision.label;
-      contact = await applyContactState({ phone, patch });
+      contact = contactWithPatch(storedContact, patch) as typeof contact;
 
       const missing = conversationMissingFields(category, contact);
       const completeForQuote = isQuoteEligible(category, contact) && missing.length === 0;
@@ -802,9 +898,14 @@ async function processInbound(phone: string): Promise<void> {
       } else {
         responseText = decision.reply;
       }
+      const finalPatch = mergeContactPatches(patch, statePatch);
+      if (await hasUnbatchedInbound(phone, ids)) {
+        await markEvents(ids, "superseded_by_new_inbound");
+        return;
+      }
       contact = await applyContactState({
         phone,
-        patch: statePatch,
+        patch: finalPatch,
         taskTitle,
         taskDescription,
       });
@@ -814,11 +915,24 @@ async function processInbound(phone: string): Promise<void> {
     responseText = sanitizePlainText(
       responseText || "Para poder seguir, ¿podés contarme qué necesitás resolver con energía solar?",
     );
-    const outboundId = await sendWhatsAppText(phone, responseText, {
-      dedupeKey: replyKey,
-      kind: "customer_reply",
-      metadata: { inbound_event_ids: ids, response_model: responseModel },
-    });
+    if (await hasUnbatchedInbound(phone, ids)) {
+      await markEvents(ids, "superseded_by_new_inbound");
+      return;
+    }
+    let outboundId: string;
+    try {
+      outboundId = await sendWhatsAppText(phone, responseText, {
+        dedupeKey: replyKey,
+        kind: "customer_reply",
+        metadata: { inbound_event_ids: ids, response_model: responseModel },
+      });
+    } catch (error) {
+      if (error instanceof CustomerReplySupersededError) {
+        await markEvents(ids, "superseded_by_new_inbound");
+        return;
+      }
+      throw error;
+    }
     const assistantSourceId = `assistant:${batchId}`;
     const assistantInsert = await db().from("agent_messages").upsert({
       contact_phone: phone,
@@ -844,13 +958,12 @@ async function processInbound(phone: string): Promise<void> {
 }
 
 async function enqueueIfNeeded(phone: string): Promise<void> {
-  const pending = await db().from("agent_inbound_events").select("id", { count: "exact", head: true })
-    .eq("phone", phone).is("processed_at", null);
+  const pending = await db().from("agent_inbound_events").select("received_at")
+    .eq("phone", phone).is("processed_at", null).order("received_at", { ascending: false }).limit(1)
+    .maybeSingle();
   if (pending.error) throw pending.error;
-  if ((pending.count ?? 0) > 0) {
-    const queued = await db().rpc("agent_enqueue_phone", { p_phone: phone, p_delay_seconds: 1 });
-    if (queued.error) throw queued.error;
-  }
+  if (!pending.data) return;
+  await enqueuePhone(phone, inboundDebounceRemainingSeconds(pending.data.received_at));
 }
 
 async function finishJob(job: Job, error?: unknown): Promise<void> {

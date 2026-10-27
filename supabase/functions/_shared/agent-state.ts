@@ -1,3 +1,4 @@
+import { BATTERY_PLAN_PRODUCT, requestsBatteryPlan } from "./battery-plan.ts";
 import { AGENT_CATEGORIES, type AgentCategory, type AgentFieldUpdates } from "./decision.ts";
 
 const EXTRACTABLE_FIELDS = [
@@ -136,6 +137,10 @@ export function explicitAgentFields(
       .test(incoming)
   ) {
     fields.product_interest = "Comparar sistema on-grid y sistema con batería";
+  }
+
+  if (requestsBatteryPlan(incoming)) {
+    fields.product_interest = BATTERY_PLAN_PRODUCT;
   }
 
   const hasChapa = /\bchapa\b/i.test(incoming);

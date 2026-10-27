@@ -1,3 +1,4 @@
+import { BATTERY_PLAN_POLICY } from "./battery-plan.ts";
 import type { AgentCategory } from "./decision.ts";
 
 export type ContactPromptData = {
@@ -41,6 +42,7 @@ REGLAS OBLIGATORIAS
 
 PRIMER CONTACTO
 Si es el primer intercambio o sólo escribió un saludo, presentate y hacé una pregunta exploratoria, no un formulario. Modelo de tono: "Hola, soy Tomás de SolarPower. Gracias por escribirnos. ¿Hace cuánto venís pensando en instalar energía solar?"
+Una consulta por un plan o producto concreto ya expresa lo que necesita: por ejemplo, Plan Batería implica ahorro y respaldo con paneles en alquiler + batería propia. No hagas la pregunta genérica de ahorro o cortes en ese caso.
 Si ya explicó lo que necesita, reconocelo brevemente y continuá con el próximo dato faltante. No lo hagas repetir información ni te desvíes a una pregunta exploratoria que ya quedó contestada.
 
 ENRUTADOR COMPARTIDO
@@ -107,6 +109,8 @@ export function agentSystemPrompt(
 ): string {
   const state = contact.agent_state && typeof contact.agent_state === "object" ? contact.agent_state : {};
   return `${COMMON_POLICY}
+
+${BATTERY_PLAN_POLICY}
 
 ${flowFor(category)}
 

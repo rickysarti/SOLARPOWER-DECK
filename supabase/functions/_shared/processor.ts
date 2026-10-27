@@ -1,3 +1,4 @@
+import { batteryPlanReplyViolations } from "./battery-plan.ts";
 import { type AgentMessage, classifyContact, classifyMedia, type MediaClassification } from "./anthropic.ts";
 import { processAgendaMessage } from "./agenda.ts";
 import {
@@ -488,6 +489,9 @@ async function modelDecision(
       const raw = await askClaude(agentSystemPrompt(contact, category, correction), history, 1200);
       const decision = parseAgentDecision(raw, category);
       const violations = replyViolations(decision.reply, incoming);
+      violations.push(...batteryPlanReplyViolations(
+        decision.reply, String(contact.product_interest ?? ""), incoming,
+      ));
       if (repeatsPreviousAssistantReply(decision.reply, history)) {
         violations.push("repite exactamente la respuesta anterior");
       }

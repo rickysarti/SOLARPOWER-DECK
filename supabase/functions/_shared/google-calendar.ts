@@ -30,32 +30,56 @@ async function accessToken(): Promise<string | null> {
   return result.access_token;
 }
 
-export async function createGoogleEvent(event: CalendarEvent): Promise<string | null> {
-  const token = await accessToken();
-  if (!token) return null;
-  const calendarId = encodeURIComponent(await runtimeSecret("GOOGLE_CALENDAR_ID") ?? "primary");
+function eventBody(event: CalendarEvent) {
   const start = new Date(event.date_time);
   const end = new Date(start.getTime() + (event.duration_minutes ?? 60) * 60_000);
   const attendees = (event.attendee_emails ?? "").split(",").map((email) => email.trim()).filter(Boolean)
     .map((email) => ({ email }));
+  return {
+    summary: event.title,
+    description: event.description ?? undefined,
+    location: event.location ?? undefined,
+    start: { dateTime: start.toISOString(), timeZone: "America/Argentina/Buenos_Aires" },
+    end: { dateTime: end.toISOString(), timeZone: "America/Argentina/Buenos_Aires" },
+    attendees: attendees.length ? attendees : undefined,
+  };
+}
+
+async function calendarRequest(
+  method: "POST" | "PATCH" | "DELETE",
+  eventId: string | null,
+  body?: unknown,
+): Promise<Record<string, any> | null> {
+  const token = await accessToken();
+  if (!token) return null;
+  const calendarId = encodeURIComponent(await runtimeSecret("GOOGLE_CALENDAR_ID") ?? "primary");
+  const path = eventId ? `/${encodeURIComponent(eventId)}` : "";
   const response = await fetch(
-    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?sendUpdates=all`,
+    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events${path}?sendUpdates=all`,
     {
-      method: "POST",
+      method,
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        summary: event.title,
-        description: event.description ?? undefined,
-        location: event.location ?? undefined,
-        start: { dateTime: start.toISOString(), timeZone: "America/Argentina/Buenos_Aires" },
-        end: { dateTime: end.toISOString(), timeZone: "America/Argentina/Buenos_Aires" },
-        attendees: attendees.length ? attendees : undefined,
-      }),
+      ...(body ? { body: JSON.stringify(body) } : {}),
     },
   );
-  const result = await response.json();
+  // Deleted by hand in Google Calendar: there is nothing left to change there.
+  if (eventId && [404, 410].includes(response.status)) return null;
+  const result = method === "DELETE" && response.ok ? {} : await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(`Google Calendar ${response.status}: ${JSON.stringify(result).slice(0, 300)}`);
   }
-  return result.id ?? null;
+  return result;
+}
+
+export async function createGoogleEvent(event: CalendarEvent): Promise<string | null> {
+  const result = await calendarRequest("POST", null, eventBody(event));
+  return result?.id ?? null;
+}
+
+export async function updateGoogleEvent(eventId: string, event: CalendarEvent): Promise<void> {
+  await calendarRequest("PATCH", eventId, eventBody(event));
+}
+
+export async function deleteGoogleEvent(eventId: string): Promise<void> {
+  await calendarRequest("DELETE", eventId);
 }

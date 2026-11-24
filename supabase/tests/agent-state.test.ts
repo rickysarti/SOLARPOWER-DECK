@@ -55,16 +55,16 @@ Deno.test("el agente no pisa un cambio manual del CRM", () => {
   assertEquals(patch.email, "lead@example.com");
 });
 
-Deno.test("academia no inicia un formulario ni exige datos personales o solares", () => {
+Deno.test("academia reúne nombre completo, email y localidad sin pedir datos solares", () => {
   assertEquals(
     conversationMissingFields("academia", { name: "Tobias", email: null, locality: null }),
-    [],
+    ["nombre completo", "email", "localidad o provincia"],
   );
   assertEquals(
     conversationMissingFields("academia", {
-      name: null,
-      email: null,
-      locality: null,
+      name: "Tobias Fernando Bordón",
+      email: "tobias@example.com",
+      locality: "Córdoba",
     }),
     [],
   );
@@ -106,9 +106,26 @@ Deno.test("extrae nombre completo, off-grid y lista de cargas sin depender del m
     ),
     {
       name: "Raul Maizterrena",
+      product_interest: "Sistema off-grid sin conexión a red",
       connection_type: "off-grid sin red eléctrica",
       consumption_evidence: "lista de equipos proporcionada",
     },
+  );
+});
+
+Deno.test("la primera respuesta enruta al producto solar correcto", () => {
+  assertEquals(
+    explicitAgentFields("Quiero bajar la factura", "necesidad o producto").product_interest,
+    "Sistema on-grid para ahorro",
+  );
+  assertEquals(
+    explicitAgentFields("Quiero tener energía cuando se va la luz", "necesidad o producto")
+      .product_interest,
+    "Sistema híbrido con batería para cortes",
+  );
+  assertEquals(
+    explicitAgentFields("Las dos", "necesidad o producto").product_interest,
+    "Sistema híbrido con batería para ahorro y respaldo",
   );
 });
 
@@ -119,6 +136,10 @@ Deno.test("acepta un nombre completo escrito como respuesta directa", () => {
   assertEquals(explicitAgentFields("Buenos Aires", "localidad o provincia"), {
     province: "Buenos Aires",
   });
+  assertEquals(explicitAgentFields("Morón", "localidad o provincia"), {
+    locality: "Morón",
+  });
+  assertEquals(explicitAgentFields("ah excelente gracias", "nombre completo"), {});
   const patch = safeAgentPatch(
     { name: "Tobias", agent_state: {} },
     { name: "Tobias Fernando Bordón" },

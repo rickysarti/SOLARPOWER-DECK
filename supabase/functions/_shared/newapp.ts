@@ -5,7 +5,6 @@ import {
   fetchJson,
   newappSecret,
   runtimeSetting,
-  sendPulseText,
 } from "./runtime.ts";
 
 type SystemConfig = {
@@ -1103,7 +1102,15 @@ export async function sendMorningReport(): Promise<TaskResult> {
   let failed = 0;
   for (const phone of phones) {
     try {
-      await sendPulseText("newapp", newappSecret, phone, lines.join("\n"));
+      // The outbox delivers through the configured WhatsApp provider and retries on its own.
+      const queued = await db().from("agent_outbound_messages").upsert({
+        phone,
+        content: lines.join("\n"),
+        kind: "morning_report",
+        dedupe_key: `morning-report:${argentinaDate()}:${phone}`,
+        metadata: { logical_key: `morning-report:${argentinaDate()}:${phone}` },
+      }, { onConflict: "dedupe_key", ignoreDuplicates: true });
+      if (queued.error) throw queued.error;
       succeeded += 1;
     } catch (error) {
       console.error("NEWAPP morning report", error);

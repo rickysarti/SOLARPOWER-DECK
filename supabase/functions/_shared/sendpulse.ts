@@ -1,9 +1,22 @@
-import { runtimeSecret } from "./db.ts";
+import { db, runtimeSecret } from "./db.ts";
 import { normalizePhone } from "./meta.ts";
+import { DeliveryUncertainError } from "./errors.ts";
 
 const API_BASE = "https://api.sendpulse.com";
 let tokenCache: { value: string; expiresAt: number } | null = null;
 let botIdCache: string | null = null;
+let staticApiKeyPromise: Promise<string | null> | null = null;
+
+async function staticApiKey(): Promise<string | null> {
+  if (!staticApiKeyPromise) {
+    staticApiKeyPromise = (async () => {
+      const { data, error } = await db().rpc("agent_get_sendpulse_api_key");
+      if (error) throw error;
+      return typeof data === "string" && data ? data : null;
+    })();
+  }
+  return await staticApiKeyPromise;
+}
 
 export type SendPulseChatMessage = {
   id?: string;
@@ -23,6 +36,8 @@ export type SendPulseChat = {
 };
 
 async function requestToken(force = false): Promise<string> {
+  const apiKey = await staticApiKey();
+  if (apiKey) return apiKey;
   if (!force && tokenCache && Date.now() < tokenCache.expiresAt) return tokenCache.value;
   const clientId = await runtimeSecret("SENDPULSE_API_ID");
   const clientSecret = await runtimeSecret("SENDPULSE_API_SECRET");
@@ -142,25 +157,36 @@ export function splitText(text: string, maxChars = 500): string[] {
 
 async function sendChunk(phone: string, text: string, attempt = 0): Promise<Record<string, unknown>> {
   const token = await requestToken();
+  const targetBotId = await botId();
   const response = await fetch(`${API_BASE}/whatsapp/contacts/sendByPhone`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({
       phone: normalizePhone(phone),
-      bot_id: await botId(),
+      bot_id: targetBotId,
       message: { type: "text", text: { body: text } },
     }),
+  }).catch(() => {
+    throw new DeliveryUncertainError("SendPulse send outcome unknown after network failure");
   });
-  const raw = await response.text();
+  const raw = await response.text().catch(() => {
+    throw new DeliveryUncertainError("SendPulse response body unavailable after send");
+  });
   let result: Record<string, unknown> = {};
   try {
     result = raw ? JSON.parse(raw) : {};
   } catch {
     result = { response: raw.slice(0, 300) };
   }
-  const retryable = response.status === 401 || response.status === 408 || response.status === 425 ||
-    response.status === 429 || response.status >= 500 ||
-    (response.status === 400 && /temporar|unavailable|try again|timeout|internal error/i.test(raw));
+  // A timeout or server error may occur after accepting the message. Never
+  // resend an ambiguous POST: SendPulse does not accept our idempotency key.
+  if (
+    response.status === 408 || response.status >= 500 ||
+    (response.status === 400 && /timeout|internal error/i.test(raw))
+  ) {
+    throw new DeliveryUncertainError(`SendPulse ${response.status}: delivery outcome unknown`);
+  }
+  const retryable = response.status === 401 || response.status === 429;
   if (!response.ok && retryable && attempt < 2) {
     if (response.status === 401) await requestToken(true);
     await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)));

@@ -16,3 +16,9 @@ export function errorMessage(error: unknown, maxLength = 1200): string {
   }
   return String(error).slice(0, maxLength);
 }
+export class DeliveryUncertainError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeliveryUncertainError";
+  }
+}

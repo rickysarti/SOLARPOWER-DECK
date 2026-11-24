@@ -54,6 +54,8 @@ def main() -> int:
         secret = values.get(source)
         if not secret:
             continue
+        if destination == "ANTHROPIC_MODEL" and secret == "claude-haiku-4-5-20251001":
+            secret = "claude-haiku-5-5"
         request = urllib.request.Request(
             f"{supabase_url}/rest/v1/rpc/agent_set_runtime_secret",
             data=json.dumps({"p_name": destination, "p_value": secret}).encode(),

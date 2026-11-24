@@ -7,6 +7,7 @@ import {
   type SendPulseChatMessage,
 } from "./sendpulse.ts";
 import { cancelPendingCustomerReplies, enqueuePhone, recordWebhookReceipt } from "./webhook.ts";
+import { applyContactState, syncMessageToCrm } from "./crm-compat.ts";
 
 type ExistingInbound = {
   provider_message_id: string;
@@ -264,4 +265,118 @@ export async function reconcileSendPulseInbound(): Promise<ReconciliationResult>
     directionCounts,
     newestInboxMessageAt,
   };
+}
+
+type DeliveredReply = { content: string; created_at: string; metadata?: Record<string, any> | null };
+
+// Outgoing SendPulse messages the bot did not send: replies a person wrote from
+// the SendPulse inbox. They never reach agent_* tables, so without this the bot
+// would answer as if the human conversation had not happened.
+export function operatorRepliesFromHistory(
+  messages: SendPulseChatMessage[],
+  delivered: DeliveredReply[],
+): Array<{ content: string; created_at: string }> {
+  const botTexts = delivered.flatMap((row) => [row.content, row.metadata?.logical_content])
+    .map(normalizedText).filter(Boolean);
+  const replies: Array<{ content: string; created_at: string }> = [];
+  for (const message of messages) {
+    if (isInboundSendPulseMessage(message)) continue;
+    const content = normalizedText(sendPulseMessageContent(message).content);
+    if (!content || botTexts.some((text) => text.includes(content))) continue;
+    replies.push({ content, created_at: messageTime(message) });
+  }
+  return replies;
+}
+
+export async function fetchOperatorReplies(
+  contactId: string,
+  delivered: DeliveredReply[],
+): Promise<Array<{ content: string; created_at: string }>> {
+  return operatorRepliesFromHistory(await listSendPulseChatMessages(contactId, 50), delivered);
+}
+
+export type OutageContact = {
+  phone: string;
+  name: string | null;
+  inbound: number;
+  outbound: number;
+  firstInboundAt: string;
+  lastInboundAt: string;
+};
+
+// Messages sent while the WhatsApp connection was down reached only the phone,
+// where the team answered them by hand. Store them as already handled history,
+// never as pending turns, and put the contact in human mode.
+export async function quarantineOutageMessages(
+  since: string,
+  until: string,
+  apply: boolean,
+): Promise<{ contacts: OutageContact[]; applied: boolean }> {
+  const from = new Date(since).getTime();
+  const to = new Date(until).getTime();
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) throw new Error("Invalid outage window");
+  const contacts: OutageContact[] = [];
+  for (const chat of await listRecentSendPulseChats(100)) {
+    const id = contactId(chat);
+    const phone = contactPhone(chat);
+    if (!id || !phone) continue;
+    const window = (await listSendPulseChatMessages(id, 100)).filter((message) => {
+      const at = new Date(messageTime(message)).getTime();
+      return at >= from && at <= to;
+    }).reverse();
+    const inbound = window.filter((message) => isInboundSendPulseMessage(message));
+    if (!inbound.length) continue;
+    const name = contactName(chat);
+    contacts.push({
+      phone,
+      name,
+      inbound: inbound.length,
+      outbound: window.length - inbound.length,
+      firstInboundAt: messageTime(inbound[0]),
+      lastInboundAt: messageTime(inbound.at(-1)!),
+    });
+    if (!apply) continue;
+    await applyContactState({
+      phone,
+      patch: { name, human_mode: true, label: "Revisión humana" },
+      taskTitle: "Revisar mensajes de la caída de WhatsApp",
+      taskDescription:
+        "Escribió mientras WhatsApp estaba desconectado de la API (19/10 20:55 a 20/10). Los mensajes se respondieron a mano desde el celular; el bot quedó pausado para este contacto.",
+    });
+    for (const message of window) {
+      const parsed = sendPulseMessageContent(message);
+      const providerMessageId = message.id
+        ? `sendpulse:${message.id}`
+        : `sendpulse:outage:${id}:${messageTime(message)}`;
+      if (isInboundSendPulseMessage(message)) {
+        const stored = await db().from("agent_inbound_events").upsert({
+          provider_message_id: providerMessageId,
+          provider: "sendpulse",
+          provider_contact_id: id,
+          phone,
+          contact_name: name,
+          message_type: parsed.type,
+          content: parsed.content,
+          media_url: parsed.mediaUrl,
+          media_mime_type: parsed.mimeType,
+          raw_payload: { source: "outage_quarantine", message },
+          received_at: messageTime(message),
+          processed_at: new Date().toISOString(),
+          disposition: "human_mode",
+        }, { onConflict: "provider_message_id", ignoreDuplicates: true });
+        if (stored.error) throw stored.error;
+      }
+      if (parsed.content) {
+        await syncMessageToCrm({
+          phone,
+          name,
+          role: isInboundSendPulseMessage(message) ? "user" : "assistant",
+          content: parsed.content,
+          sourceId: `outage:${providerMessageId}`,
+          model: isInboundSendPulseMessage(message) ? null : "whatsapp-business-app",
+        });
+      }
+    }
+  }
+  return { contacts, applied: apply };
 }

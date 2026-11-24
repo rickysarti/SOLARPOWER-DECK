@@ -11,11 +11,15 @@ import { agentSystemPrompt } from "../functions/_shared/prompts.ts";
 import {
   academyCompletionDecision,
   deterministicDecision,
+  exhaustedRepeatedField,
+  explicitCategoryFromText,
   explicitFieldsFromConversation,
+  fullConversationForClaude,
   isQuoteStatusFollowup,
   repeatedAssistantQuestionField,
   repeatsPreviousAssistantReply,
   replyRequestsField,
+  unavailableFieldFromReply,
   uncertaintyHandoffDecision,
 } from "../functions/_shared/processor.ts";
 import { splitText } from "../functions/_shared/sendpulse.ts";
@@ -60,6 +64,49 @@ Deno.test("responde quién es sin reiniciar el cuestionario", () => {
   assertEquals((decision?.reply.match(/\?/g) ?? []).length, 0);
 });
 
+Deno.test("un pedido genérico de información inicia conversación sin derivar", () => {
+  const decision = deterministicDecision("QUIERO INFORMACION", "residencial", true);
+  assertEquals(decision?.handoff, false);
+  assert(decision?.reply.includes("ahorro en la factura"));
+  assert(decision?.reply.includes("cuando se va la luz"));
+  assertEquals((decision?.reply.match(/\?/g) ?? []).length, 1);
+});
+
+Deno.test("un saludo solo abre siempre con ahorro versus cortes", () => {
+  const decision = deterministicDecision("Buenas", "residencial", true);
+  assertEquals(decision?.handoff, false);
+  assert(decision?.reply.includes("ahorro en la factura"));
+  assert(decision?.reply.includes("cuando se va la luz"));
+});
+
+Deno.test("el prompt reconoce el Plan SolarPower y una negación del modelo se rechaza", () => {
+  const incoming =
+    "Quiero una cotización del PLAN SOLARPOWER (alquiler de paneles). Entiendo que pago un anticipo bajo y la cuota se cubre con parte del ahorro.";
+  const prompt = agentSystemPrompt({ phone: "5491128975308" }, "residencial");
+  assert(prompt.includes("SolarPower sí ofrece el Plan SolarPower"));
+  assert(prompt.includes("se paga con parte del ahorro que genera"));
+  assert(prompt.includes("entre 12% y 20%"));
+  assertEquals(
+    replyViolations(
+      "SolarPower no ofrece alquiler de paneles ni planes de financiación con anticipo bajo.",
+      incoming,
+    ),
+    ["niega incorrectamente el Plan SolarPower"],
+  );
+  assertEquals(
+    replyViolations(
+      "Sí, ese es el Plan SolarPower: la cuota se diseña para ser menor que el ahorro. ¿Podés enviarme una factura reciente?",
+      incoming,
+    ),
+    [],
+  );
+});
+
+Deno.test("reclasifica explícitamente una consulta de cursos en cada turno", () => {
+  assertEquals(explicitCategoryFromText("En realidad quiero información sobre los cursos"), "academia");
+  assertEquals(explicitCategoryFromText("Tengo techo de chapa"), null);
+});
+
 Deno.test("un reclamo de presupuesto pendiente activa el seguimiento", () => {
   assert(isQuoteStatusFollowup("Buenas tardes. Algún inconveniente? No recibí nada todavía!"));
   assert(isQuoteStatusFollowup("Quedaron en mandarme las dos propuestas"));
@@ -86,12 +133,32 @@ Deno.test("reconstruye el contexto de toda la conversación anterior", () => {
   assertEquals(fields, {
     province: "Neuquén",
     locality: "Neuquén Capital",
-    product_interest: "Comparar sistema on-grid y sistema con batería",
+    product_interest: "Sistema híbrido con batería para ahorro y respaldo",
     roof_type: "Techo de tejas",
     connection_type: "monofásica",
     name: "Juan Carlos Palagani",
     email: "palaganij@hotmail.com",
   });
+});
+
+Deno.test("Claude recibe todo el historial y siempre incluye el mensaje actual", () => {
+  const previous = [
+    { role: "user" as const, content: "Es un edificio en construcción" },
+    { role: "assistant" as const, content: "¿En qué localidad está?" },
+    { role: "user" as const, content: "CABA" },
+    { role: "assistant" as const, content: "¿Qué consumos querés alimentar?" },
+  ];
+  const complete = fullConversationForClaude(
+    previous,
+    "Equipos 100 artefactos de iluminación de 50 W",
+  );
+  assertEquals(complete.length, 5);
+  assertEquals(complete[0], previous[0]);
+  assertEquals(complete.at(-1), {
+    role: "user",
+    content: "Equipos 100 artefactos de iluminación de 50 W",
+  });
+  assertEquals(fullConversationForClaude(complete, complete.at(-1)!.content).length, 5);
 });
 
 Deno.test("detecta una respuesta exactamente repetida", () => {
@@ -123,6 +190,24 @@ Deno.test("detecta preguntas reformuladas que vuelven a pedir el mismo dato", ()
     repeatedAssistantQuestionField(reformulated, history),
     "factura, consumo o lista de cargas",
   );
+});
+
+Deno.test("no confunde reducir la factura con pedir una factura de consumo", () => {
+  assertEquals(
+    replyRequestsField(
+      "¿Cuál es tu principal objetivo: tener respaldo, reducir la factura o una combinación de ambos?",
+      "factura, consumo o lista de cargas",
+    ),
+    false,
+  );
+});
+
+Deno.test("una negativa explícita permite avanzar con los datos disponibles", () => {
+  const history = [
+    { role: "assistant" as const, content: "¿Sabés si la conexión es monofásica o trifásica?" },
+    { role: "user" as const, content: "No sé, no tengo forma de verlo" },
+  ];
+  assertEquals(unavailableFieldFromReply("No sé, no tengo forma de verlo", history), "tipo de conexión");
 });
 
 Deno.test("el debounce vence un minuto después del último mensaje", () => {
@@ -178,6 +263,7 @@ Deno.test("academia completa informa el estado real sin derivar a una persona", 
     phone: "5491157150566",
     name: "Mauro David Rodríguez",
     email: "maurodavidrodriguez@hotmail.com.ar",
+    locality: "Córdoba",
   });
   assertEquals(decision.handoff, false);
   assertEquals(decision.label, "Academia Solar");
@@ -187,12 +273,53 @@ Deno.test("academia completa informa el estado real sin derivar a una persona", 
   assertEquals((decision.reply.match(/\?/g) ?? []).length, 0);
 });
 
-Deno.test("academia sin datos personales registra el interés y avisa por WhatsApp", () => {
+Deno.test("academia sin datos personales empieza por el nombre completo", () => {
   const decision = academyCompletionDecision({ phone: "5491100000000" });
   assertEquals(decision.handoff, false);
-  assert(decision.reply.includes("registramos tu interés"));
-  assert(decision.reply.includes("avisar por este medio"));
-  assertEquals((decision.reply.match(/\?/g) ?? []).length, 0);
+  assert(decision.reply.includes("está en preparación"));
+  assert(decision.reply.includes("nombre completo"));
+  assertEquals(decision.missingFields, ["nombre completo", "email", "localidad o provincia"]);
+  assertEquals((decision.reply.match(/\?/g) ?? []).length, 1);
+});
+
+Deno.test("academia pide un dato por turno y continúa aunque el cliente agradezca", () => {
+  const email = academyCompletionDecision({
+    phone: "5491100000000",
+    name: "Soni Apellido",
+  });
+  assert(email.reply.includes("email"));
+  assertEquals(email.missingFields, ["email", "localidad o provincia"]);
+  const locality = academyCompletionDecision({
+    phone: "5491100000000",
+    name: "Soni Apellido",
+    email: "soni@example.com",
+  });
+  assert(locality.reply.includes("localidad"));
+  assertEquals((locality.reply.match(/\?/g) ?? []).length, 1);
+
+  const first = academyCompletionDecision(
+    { phone: "5491100000000" },
+    "Quiero información sobre el curso de instalador",
+  );
+  const thanks = academyCompletionDecision(
+    { phone: "5491100000000", label: "Academia Solar" },
+    "ah excelente gracias",
+  );
+  assertEquals(thanks.reply.startsWith("De nada"), true);
+  assertEquals(thanks.reply === first.reply, false);
+});
+
+Deno.test("después de dos pedidos del mismo dato avanza sin entrar en bucle", () => {
+  const history = [
+    { role: "assistant" as const, content: "¿Tenés una factura, consumo o lista de equipos?" },
+    { role: "user" as const, content: "Es un edificio de 12 pisos" },
+    { role: "assistant" as const, content: "¿Podés pasarme una lista de equipos o el consumo?" },
+    { role: "user" as const, content: "Todavía está en construcción" },
+  ];
+  assertEquals(
+    exhaustedRepeatedField(["factura, consumo o lista de cargas", "techo o superficie"], history),
+    "factura, consumo o lista de cargas",
+  );
 });
 
 Deno.test("la detección de preguntas repetidas es sólo una barrera de seguridad", () => {
@@ -236,11 +363,14 @@ Deno.test("todos los prompts incluyen la política compartida de cargadores y se
     assert(prompt.includes("presupuesto pendiente"));
     assert(prompt.includes("prometió enviar algo después"));
     assert(prompt.includes("No te obligan a preguntar nada"));
-    assert(prompt.includes("Ante cualquier duda real"));
+    assert(prompt.includes("no esperes frases clave"));
+    assert(prompt.includes("decidí vos cuál es la respuesta natural"));
+    assert(prompt.includes("No derives sólo por ambigüedad"));
+    assert(prompt.includes("SolarPower sí ofrece el Plan SolarPower"));
     if (category === "academia") {
       assert(prompt.includes("todavía está en preparación"));
-      assert(prompt.includes("No inicies un formulario"));
-      assert(prompt.includes("ni pidas nombre, email, localidad"));
+      assert(prompt.includes("nombre completo, email y localidad/provincia"));
+      assert(prompt.includes("una sola pregunta por turno"));
       assert(prompt.includes("handoff=false"));
     }
   }

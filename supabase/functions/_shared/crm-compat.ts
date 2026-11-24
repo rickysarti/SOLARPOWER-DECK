@@ -129,6 +129,8 @@ export async function syncMessageToCrm(input: {
   content: string;
   sourceId: string;
   model?: string | null;
+  metadata?: Record<string, unknown>;
+  attachments?: Array<Record<string, unknown>>;
 }): Promise<void> {
   const conversation = await conversationId(input.phone, input.name);
   const { data: duplicate, error: lookupError } = await db().from("chatbot_messages").select("id")
@@ -141,7 +143,8 @@ export async function syncMessageToCrm(input: {
     role: input.role,
     content: input.content,
     model: input.model ?? null,
-    metadata: { source: "agent-supabase", agent_source_id: input.sourceId },
+    metadata: { ...(input.metadata ?? {}), source: "agent-supabase", agent_source_id: input.sourceId },
+    ...(input.attachments?.length ? { attachments: input.attachments } : {}),
   });
   if (error) throw error;
   await db().from("chatbot_conversations").update({ updated_at: new Date().toISOString() }).eq(

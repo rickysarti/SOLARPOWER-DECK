@@ -1,8 +1,48 @@
 import { db, setting } from "./db.ts";
-import { errorMessage } from "./errors.ts";
-import { downloadMetaMedia, sendMetaText } from "./meta.ts";
+import { DeliveryUncertainError, errorMessage } from "./errors.ts";
+import {
+  downloadMetaMedia,
+  sendMetaDocument,
+  sendMetaTemplate,
+  sendMetaText,
+  sendMetaTextOrTemplate,
+} from "./meta.ts";
 import { downloadSendPulseMedia, sendSendPulseChunk, splitText } from "./sendpulse.ts";
 import { sanitizePlainText } from "./output.ts";
+import { applyContactState } from "./crm-compat.ts";
+
+export class CustomerReplySuppressedError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "CustomerReplySuppressedError";
+  }
+}
+
+async function suppressReply(row: OutboundRow, reason: string, review = false): Promise<never> {
+  const cancelled = await db().from("agent_outbound_messages").update({
+    status: "cancelled",
+    error: reason,
+    updated_at: new Date().toISOString(),
+  }).eq("id", row.id).in("status", ["pending", "failed", "sending"]);
+  if (cancelled.error) throw cancelled.error;
+  const logged = await db().from("agent_conversation_logs").insert({
+    contact_phone: row.phone,
+    event_type: "reply_suppressed",
+    summary: reason,
+    metadata: { outbound_id: row.id },
+  });
+  if (logged.error) throw logged.error;
+  if (review) {
+    await applyContactState({
+      phone: row.phone,
+      patch: { human_mode: true, label: "Revisión humana" },
+      taskTitle: "Revisar respuesta repetida bloqueada",
+      taskDescription:
+        "El bloqueo final impidió repetir un mensaje. Continuar personalmente con el historial disponible.",
+    });
+  }
+  throw new CustomerReplySuppressedError(reason);
+}
 
 export async function whatsappProvider(): Promise<string> {
   return (await setting("whatsapp_provider")) ?? "sendpulse";
@@ -50,17 +90,80 @@ export async function preparedWhatsAppText(logicalKey: string): Promise<Prepared
   };
 }
 
+type OutboundDocument = { link: string; filename: string };
+
+function outboundDocument(row: OutboundRow): OutboundDocument | null {
+  const document = row.metadata?.document as Record<string, unknown> | undefined;
+  if (typeof document?.link !== "string" || typeof document?.filename !== "string") return null;
+  return { link: document.link, filename: document.filename };
+}
+
+async function deliverViaMeta(row: OutboundRow): Promise<string> {
+  const document = outboundDocument(row);
+  if (document) return await sendMetaDocument(row.phone, { ...document, caption: row.content });
+  // Bot replies always answer a fresh customer message. Anything else (CRM
+  // follow-ups, internal notices) can fall outside the 24-hour window and then
+  // only goes out as the approved follow-up template.
+  if (row.kind === "customer_reply") return await sendMetaText(row.phone, row.content);
+  const template = {
+    name: await setting(
+      ["agenda_reminder", "morning_report"].includes(row.kind) ? "meta_internal_template" : "meta_followup_template",
+    ),
+    language: (await setting("meta_template_language")) ?? "es_AR",
+  };
+  // Outside the window Meta accepts a free text and only fails it later through a
+  // status callback, so the window is checked before calling the provider.
+  const last = await db().from("agent_inbound_events").select("received_at").eq("phone", row.phone)
+    .order("received_at", { ascending: false }).limit(1).maybeSingle();
+  if (last.error) throw last.error;
+  if (!last.data || Date.now() - new Date(last.data.received_at).getTime() >= 24 * 60 * 60_000) {
+    if (!template.name) throw new Error("Outside the 24-hour window and no approved template is configured");
+    return await sendMetaTemplate(row.phone, {
+      name: template.name,
+      language: template.language,
+      bodyParameters: [row.content],
+    });
+  }
+  return await sendMetaTextOrTemplate(row.phone, row.content, template);
+}
+
 async function deliverRow(row: OutboundRow): Promise<string> {
   if (["sent", "delivered", "read"].includes(row.status) && row.provider_message_id) {
     return row.provider_message_id;
   }
+  if (row.kind === "customer_reply") {
+    if (["cancelled", "uncertain"].includes(row.status)) {
+      throw new CustomerReplySuppressedError(`Customer reply ${row.status}`);
+    }
+    if ((await setting("bot_enabled")) !== "true") return await suppressReply(row, "Bot paused");
+    const contact = await db().from("chatbot_wa_contacts").select("human_mode,updated_at")
+      .eq("phone", row.phone).maybeSingle();
+    if (contact.error) throw contact.error;
+    if (
+      contact.data?.human_mode
+    ) {
+      return await suppressReply(row, "Contact in human mode");
+    }
+  }
   const attempts = Number(row.attempts ?? 0) + 1;
+  // Unsent rows follow the provider configured now, so the cutover to Meta also
+  // covers messages queued while SendPulse was still active.
+  const provider = await whatsappProvider();
   const locking = await db().from("agent_outbound_messages").update({
     status: "sending",
+    provider,
     attempts,
     updated_at: new Date().toISOString(),
   }).eq("id", row.id).in("status", ["pending", "failed"]).select("id").maybeSingle();
-  if (locking.error) throw locking.error;
+  if (locking.error) {
+    if (row.kind === "customer_reply" && locking.error.message.includes("customer_turn_already_answered")) {
+      return await suppressReply(row, "Inbound turn already answered by another worker");
+    }
+    if (row.kind === "customer_reply" && locking.error.message.includes("customer_reply_duplicate")) {
+      return await suppressReply(row, "Duplicate customer reply blocked before provider call", true);
+    }
+    throw locking.error;
+  }
   if (!locking.data) {
     const current = await db().from("agent_outbound_messages")
       .select("provider_message_id,status").eq("id", row.id).single();
@@ -102,19 +205,43 @@ async function deliverRow(row: OutboundRow): Promise<string> {
       if (current.error) throw current.error;
       if (current.data.status === "cancelled") throw new CustomerReplySupersededError();
     }
-    const messageId = row.provider === "meta"
-      ? await sendMetaText(row.phone, row.content)
+    const messageId = provider === "meta"
+      ? await deliverViaMeta(row)
       : await sendSendPulseChunk(row.phone, row.content);
-    await db().from("agent_outbound_messages").update({
+    const recorded = await db().from("agent_outbound_messages").update({
       status: "sent",
       provider_message_id: messageId,
       sent_at: new Date().toISOString(),
       error: null,
       updated_at: new Date().toISOString(),
     }).eq("id", row.id);
+    if (recorded.error) {
+      throw new DeliveryUncertainError("Provider accepted message but receipt persistence failed");
+    }
     return messageId;
   } catch (sendError) {
-    if (sendError instanceof CustomerReplySupersededError) throw sendError;
+    if (
+      sendError instanceof CustomerReplySupersededError || sendError instanceof CustomerReplySuppressedError
+    ) throw sendError;
+    if (sendError instanceof DeliveryUncertainError) {
+      const held = await db().from("agent_outbound_messages").update({
+        status: "uncertain",
+        error: sendError.message,
+        updated_at: new Date().toISOString(),
+      }).eq("id", row.id);
+      if (held.error) throw held.error;
+      if (row.kind === "customer_reply") {
+        await applyContactState({
+          phone: row.phone,
+          patch: { human_mode: true, label: "Revisión humana" },
+          taskTitle: "Verificar entrega de WhatsApp",
+          taskDescription:
+            "El proveedor no confirmó el resultado del envío. Revisar el chat antes de reenviar para evitar duplicados.",
+        });
+        throw new CustomerReplySuppressedError(sendError.message);
+      }
+      throw sendError;
+    }
     const terminal = attempts >= 5;
     await db().from("agent_outbound_messages").update({
       status: "failed",
@@ -140,7 +267,8 @@ async function getOrCreateOutbound(input: {
 }): Promise<OutboundRow> {
   const validate = (row: OutboundRow): OutboundRow => {
     if (
-      row.phone !== input.phone || row.provider !== input.provider || row.content !== input.content ||
+      // The provider is resolved again at delivery time, so it is not part of the identity.
+      row.phone !== input.phone || row.content !== input.content ||
       Number((row as any).chunk_index ?? 0) !== input.chunkIndex ||
       Number((row as any).chunk_count ?? 1) !== input.chunkCount
     ) {
@@ -215,8 +343,8 @@ export async function sendWhatsAppText(
 export async function retryDueOutboundMessages(limit = 20): Promise<{ sent: number; failed: number }> {
   const staleBefore = new Date(Date.now() - 10 * 60_000).toISOString();
   const recovered = await db().from("agent_outbound_messages").update({
-    status: "failed",
-    error: "Delivery lock expired before the provider result was recorded",
+    status: "uncertain",
+    error: "Delivery result unknown; automatic retry blocked to prevent duplicates",
     available_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }).eq("status", "sending").lt("updated_at", staleBefore).is("provider_message_id", null);
@@ -237,7 +365,9 @@ export async function retryDueOutboundMessages(limit = 20): Promise<{ sent: numb
       await deliverRow(row);
       sent += 1;
     } catch (error) {
-      if (error instanceof CustomerReplySupersededError) continue;
+      if (error instanceof CustomerReplySupersededError || error instanceof CustomerReplySuppressedError) {
+        continue;
+      }
       failed += 1;
     }
   }

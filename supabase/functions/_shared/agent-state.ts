@@ -62,6 +62,10 @@ function explicitFullName(incoming: string, expectedField: string | null = null)
 
   if (expectedField !== "nombre completo") return null;
   const standalone = incoming.trim().replace(/[.,;:!?]+$/g, "").replace(/\s+/g, " ");
+  if (
+    /\b(?:gracias|excelente|perfecto|hola|buen(?:os|as)?|quiero|quisiera|necesito|informaci[oó]n|curso|s[ií]|no)\b/i
+      .test(standalone)
+  ) return null;
   return /^[\p{L}][\p{L}'’\-]{1,40}(?:\s+[\p{L}][\p{L}'’\-]{1,40}){1,3}$/u.test(standalone)
     ? standalone
     : null;
@@ -124,18 +128,38 @@ export function explicitAgentFields(
   if (/\b(?:caba|capital federal|ciudad aut[oó]noma de buenos aires)\b/i.test(incoming)) {
     fields.locality = "CABA";
   }
-
-  if (/\b(?:bajar|reducir|ahorrar|ahorro)\b.{0,45}\b(?:costos?|factura|luz|electricidad)\b/i.test(incoming)) {
-    fields.product_interest = "Reducir costos de electricidad";
-  } else if (/\b(?:cortes?|respaldo)\b/i.test(incoming)) {
-    fields.product_interest = "Respaldo ante cortes de energía";
+  if (expectedField === "localidad o provincia" && !fields.locality && !fields.province) {
+    const standalonePlace = incoming.trim().replace(/[.,;:!?]+$/g, "").replace(/\s+/g, " ");
+    if (
+      /^[\p{L}][\p{L}'’\-]{1,40}(?:\s+[\p{L}][\p{L}'’\-]{1,40}){0,4}$/u.test(standalonePlace) &&
+      !/\b(?:gracias|excelente|perfecto|hola|quiero|quisiera|necesito|informaci[oó]n|curso|s[ií]|no)\b/i
+        .test(standalonePlace)
+    ) {
+      fields.locality = standalonePlace;
+    }
   }
-  if (
-    expectedField === "necesidad o producto" &&
-    /\b(?:las|ambas|dos)\s+opciones\b|\bcon\s+bater[ií]a\b.{0,60}\b(?:sin|on[ -]?grid)\b|\b(?:sin|on[ -]?grid)\b.{0,60}\bcon\s+bater[ií]a\b/i
-      .test(incoming)
-  ) {
-    fields.product_interest = "Comparar sistema on-grid y sistema con batería";
+
+  const wantsOffGrid =
+    /\b(?:sin\s+(?:conexi[oó]n|acceso)\s+a\s+la\s+red|sin\s+red|off[ -]?grid|fuera\s+de\s+red|independencia\s+total)\b/i
+      .test(incoming);
+  const wantsSavings =
+    /\b(?:bajar|reducir|ahorrar|ahorro)\b.{0,45}\b(?:costos?|factura|luz|electricidad)\b|\bfactura\b.{0,35}\b(?:bajar|reducir|ahorrar|ahorro)\b/i
+      .test(incoming);
+  const wantsBackup =
+    /\b(?:cortes?|respaldo|cuando\s+se\s+(?:va|corta)\s+(?:la\s+)?luz|tener\s+energ[ií]a\s+cuando)\b/i
+      .test(incoming);
+  const wantsBoth = expectedField === "necesidad o producto" &&
+    (/^\s*(?:(?:para\s+)?ambas|las\s+dos|los\s+dos|todo)\s*[.!]?\s*$/i.test(incoming) ||
+      /\b(?:las|ambas|dos)\s+opciones\b/i.test(incoming));
+  const explicitHybrid = /\bh[ií]brido\b|\b(?:paneles|sistema)\b.{0,40}\bbater[ií]as?\b/i.test(incoming);
+  if (wantsOffGrid) {
+    fields.product_interest = "Sistema off-grid sin conexión a red";
+  } else if (explicitHybrid || wantsBoth || (wantsSavings && wantsBackup)) {
+    fields.product_interest = "Sistema híbrido con batería para ahorro y respaldo";
+  } else if (wantsBackup) {
+    fields.product_interest = "Sistema híbrido con batería para cortes";
+  } else if (wantsSavings) {
+    fields.product_interest = "Sistema on-grid para ahorro";
   }
 
   const hasChapa = /\bchapa\b/i.test(incoming);
@@ -146,6 +170,10 @@ export function explicitAgentFields(
     fields.roof_type = /\bcom[uú]n\b/i.test(incoming) ? "Techo de chapa común" : "Techo de chapa";
   } else if (hasTeja) {
     fields.roof_type = "Techo de tejas";
+  } else if (/\btierra firme\b/i.test(incoming)) {
+    fields.roof_type = "Suelo: tierra firme";
+  } else if (/\btecho\b.{0,20}\bmaterial\b/i.test(incoming)) {
+    fields.roof_type = "Techo de material";
   } else if (/\b(?:losa|membrana)\b/i.test(incoming)) {
     fields.roof_type = /\blosa\b/i.test(incoming) ? "Techo de losa" : "Techo con membrana";
   } else if (
@@ -171,9 +199,12 @@ export function explicitAgentFields(
   }
 
   const loads = incoming.match(
-    /\b(?:heladera|freezer|luces?|focos?|bomba|lavarropas?|televisi[oó]n|televisor|starlink|electrificador|ventilador|celulares?|aires? acondicionado)\b/gi,
+    /\b(?:heladera|freezer|luces?|focos?|bomba|lavarropas?|televisi[oó]n|televisor|starlink|electrificador|ventilador|celulares?|aires?\s+(?:acondicionados?|fr[ií]o(?:\s*[/ -]?\s*calor)?)|termotanques?|splits?)\b/gi,
   ) ?? [];
-  if (new Set(loads.map((load) => load.toLowerCase())).size >= 2) {
+  if (
+    new Set(loads.map((load) => load.toLowerCase())).size >= 2 ||
+    (loads.length > 0 && /\b\d+\b/.test(incoming))
+  ) {
     fields.consumption_evidence = "lista de equipos proporcionada";
   }
   return fields;
@@ -188,7 +219,18 @@ export function conversationMissingFields(
   category: AgentCategory,
   contact: Record<string, any>,
 ): string[] {
-  if (category === "academia") return [];
+  if (category === "academia") {
+    const missing: string[] = [];
+    if (!hasFullName(contact.name)) missing.push("nombre completo");
+    if (!contact.email) missing.push("email");
+    if (!contact.locality && !contact.province) missing.push("localidad o provincia");
+    const skipped = new Set(
+      Array.isArray(stateOf(contact).skipped_fields)
+        ? stateOf(contact).skipped_fields.map((field: unknown) => String(field))
+        : [],
+    );
+    return missing.filter((field) => !skipped.has(field));
+  }
   return quoteMissingFields(contact);
 }
 

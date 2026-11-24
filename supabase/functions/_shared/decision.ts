@@ -39,6 +39,52 @@ export type AgentDecision = {
   label: string | null;
 };
 
+const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
+
+// JSON schema sent as output_config.format so the model's decision is always parseable.
+export const AGENT_DECISION_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "reply",
+    "classification",
+    "fields",
+    "missingFields",
+    "completeForQuote",
+    "handoff",
+    "handoffReason",
+    "label",
+  ],
+  properties: {
+    reply: { type: "string" },
+    classification: { type: "string", enum: [...AGENT_CATEGORIES] },
+    fields: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        name: { type: "string" },
+        email: { type: "string" },
+        locality: { type: "string" },
+        province: { type: "string" },
+        roof_type: { type: "string" },
+        connection_type: { type: "string" },
+        product_interest: { type: "string" },
+        notes: { type: "string" },
+        bill_received: { type: "boolean" },
+        consumo_mensual: { type: "number" },
+        consumo_anual: { type: "number" },
+        consumption_evidence: { type: "string" },
+        charger_scope: { type: "string", enum: ["solar_y_cargador", "solo_cargador", "desconocido"] },
+      },
+    },
+    missingFields: { type: "array", items: { type: "string" } },
+    completeForQuote: { type: "boolean" },
+    handoff: { type: "boolean" },
+    handoffReason: nullableString,
+    label: nullableString,
+  },
+};
+
 function parseObject(raw: string): Record<string, unknown> {
   const candidates = [
     raw.trim(),
@@ -119,6 +165,9 @@ export function replyViolations(reply: string, incoming: string): string[] {
   if (hasForbiddenFormatting(reply)) violations.push("contiene emoji o Markdown");
   if (/\bricardo\b/i.test(reply)) violations.push("menciona a Ricardo frente al cliente");
   if ((reply.match(/\?/g) ?? []).length > 1) violations.push("hace más de una pregunta");
+  if (/bater[ií]as?/i.test(reply) && /\b\d+\s*(?:a(?:ños|nos)|horas|ciclos)\b/i.test(reply)) {
+    violations.push("no confirmar vida útil ni autonomía de baterías sin modelo y dimensionamiento");
+  }
   if (reply.length > 480) violations.push("supera 480 caracteres");
   if (/\bcu[eé]ntame\b/i.test(reply)) violations.push("usa español no argentino");
   if (
@@ -136,6 +185,16 @@ export function replyViolations(reply: string, incoming: string): string[] {
       .test(reply)
   ) {
     violations.push("confirma cuotas o financiación sin una propuesta");
+  }
+  const asksAboutSolarPowerPlan = /\bplan\s+solarpower\b/i.test(incoming) ||
+    /\b(?:alquiler|alquilar|lease)\b.{0,55}\b(?:panel(?:es)?|sistema\s+solar)\b/i.test(incoming) ||
+    /\b(?:panel(?:es)?|sistema\s+solar)\b.{0,55}\b(?:alquiler|alquilar|lease)\b/i.test(incoming);
+  if (
+    asksAboutSolarPowerPlan &&
+    /\b(?:no\s+(?:ofrecemos|tenemos|contamos|trabajamos)|solarpower\s+no\s+ofrece)\b.{0,80}\b(?:alquiler|plan|financiaci[oó]n|panel(?:es)?|sistema)/i
+      .test(reply)
+  ) {
+    violations.push("niega incorrectamente el Plan SolarPower");
   }
   if (
     /\b(?:lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\b.{0,35}\b[0-9]{1,2}\s*(?:h|hs|horas)\b/i
@@ -157,6 +216,13 @@ export function isStandaloneLighting(incoming: string): boolean {
 }
 
 export function requestsHumanRepresentative(incoming: string): boolean {
+  const callRequest =
+    /\b(?:te\s+puedo\s+llamar|puedo\s+llamar(?:te|los|les)?|ll[aá]mame|llam[aá]me|ll[aá]mennos|me\s+(?:pod[eé]s|pueden)\s+llamar|quiero\s+(?:una\s+llamada|hablar\s+por\s+tel[eé]fono))\b/i;
+  if (
+    incoming.split(/[\n.!?]+/).some((sentence) =>
+      callRequest.test(sentence) && !/\bno\s+(?:me\s+)?(?:llam|puedo|quiero)/i.test(sentence)
+    )
+  ) return true;
   return /\b(?:hablar|comunicarme|contactarme|llamar|llamo|llame|atienda|atenderme)\b.{0,45}\b(?:representante|asesor|persona|humano|vendedor)\b/i
     .test(incoming) ||
     /\b(?:representante|asesor|persona|humano|vendedor)\b.{0,45}\b(?:hablar|comunicar|contact|llam|atienda|atender)\w*/i

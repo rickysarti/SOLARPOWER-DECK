@@ -2,17 +2,13 @@ import { db, json, runtimeSecret, setting } from "../_shared/db.ts";
 import { applyContactState } from "../_shared/crm-compat.ts";
 import { errorMessage } from "../_shared/errors.ts";
 import { normalizePhone } from "../_shared/meta.ts";
-import { processDueJobs } from "../_shared/processor.ts";
 import {
   cancelPendingCustomerReplies,
   enqueuePhone,
-  INBOUND_DEBOUNCE_SECONDS,
   payloadHash,
   recordWebhookError,
   recordWebhookReceipt,
 } from "../_shared/webhook.ts";
-
-declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
 
 const OUTGOING_TITLES = new Set([
   "outgoing_message",
@@ -136,6 +132,20 @@ async function processPayload(
   raw: unknown,
 ): Promise<{ accepted: number; ignored: number; duplicates: number }> {
   const payloads = Array.isArray(raw) ? raw : [raw];
+  // After the cutover Meta delivers every message directly; SendPulse copies would
+  // only duplicate turns (and its operator echoes would wrongly set human mode).
+  if ((await setting("whatsapp_provider")) === "meta") {
+    for (const candidate of payloads) {
+      await recordWebhookReceipt({
+        provider: "sendpulse",
+        providerEventId: `retired:${await payloadHash(candidate)}`,
+        outcome: "ignored",
+        reason: "provider_is_meta",
+        payload: candidate,
+      });
+    }
+    return { accepted: 0, ignored: payloads.length, duplicates: 0 };
+  }
   const phones = new Set<string>();
   const admins = await internalPhones();
   let accepted = 0;
@@ -235,16 +245,7 @@ async function processPayload(
     await cancelPendingCustomerReplies(phone);
     await enqueuePhone(phone);
   }
-  if (phones.size) {
-    EdgeRuntime.waitUntil((async () => {
-      await new Promise((resolve) => setTimeout(resolve, (INBOUND_DEBOUNCE_SECONDS + 1) * 1000));
-      try {
-        await processDueJobs(Math.max(phones.size, 10));
-      } catch (error) {
-        console.error("agent sendpulse background processor", errorMessage(error));
-      }
-    })());
-  }
+  // Webhooks only persist and enqueue. The minute scheduler owns processing.
   return { accepted, ignored, duplicates };
 }
 

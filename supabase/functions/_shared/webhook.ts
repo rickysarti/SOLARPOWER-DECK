@@ -57,7 +57,7 @@ export async function cancelPendingCustomerReplies(phone: string): Promise<void>
     status: "cancelled",
     error: "Superseded by a newer inbound message",
     updated_at: new Date().toISOString(),
-  }).eq("phone", phone).eq("kind", "customer_reply").in("status", ["pending", "failed", "sending"]);
+  }).eq("phone", phone).eq("kind", "customer_reply").in("status", ["pending", "failed"]);
   if (cancelled.error) throw cancelled.error;
 }
 

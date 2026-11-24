@@ -1,3 +1,4 @@
+import { batteryPlanReplyViolations } from "./battery-plan.ts";
 import { type AgentMessage, classifyContact, classifyMedia, type MediaClassification } from "./anthropic.ts";
 import { processAgendaMessage } from "./agenda.ts";
 import {
@@ -556,6 +557,9 @@ export async function modelDecision(
       );
       const decision = parseAgentDecision(raw, category);
       const violations = replyViolations(decision.reply, incoming);
+      violations.push(...batteryPlanReplyViolations(
+        decision.reply, String(contact.product_interest ?? ""), incoming,
+      ));
       const proposed = {
         ...contact,
         ...safeAgentPatch(contact, decision.fields, decision.classification, incoming),

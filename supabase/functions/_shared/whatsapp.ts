@@ -204,6 +204,15 @@ async function deliverRow(row: OutboundRow): Promise<string> {
       const current = await db().from("agent_outbound_messages").select("status").eq("id", row.id).single();
       if (current.error) throw current.error;
       if (current.data.status === "cancelled") throw new CustomerReplySupersededError();
+      // A human can take over while the worker checks the inbox and claims the
+      // outbound row. Re-read the authoritative contact immediately before send.
+      if ((await setting("bot_enabled")) !== "true") return await suppressReply(row, "Bot paused");
+      const latestContact = await db().from("chatbot_wa_contacts").select("human_mode")
+        .eq("phone", row.phone).maybeSingle();
+      if (latestContact.error) throw latestContact.error;
+      if (!latestContact.data || latestContact.data.human_mode !== false) {
+        return await suppressReply(row, "Contact unavailable or in human mode before provider call");
+      }
     }
     const messageId = provider === "meta"
       ? await deliverViaMeta(row)

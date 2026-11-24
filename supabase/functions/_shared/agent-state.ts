@@ -1,3 +1,4 @@
+import { BATTERY_PLAN_PRODUCT, requestsBatteryPlan } from "./battery-plan.ts";
 import { AGENT_CATEGORIES, type AgentCategory, type AgentFieldUpdates } from "./decision.ts";
 
 const EXTRACTABLE_FIELDS = [
@@ -152,7 +153,9 @@ export function explicitAgentFields(
     (/^\s*(?:(?:para\s+)?ambas|las\s+dos|los\s+dos|todo)\s*[.!]?\s*$/i.test(incoming) ||
       /\b(?:las|ambas|dos)\s+opciones\b/i.test(incoming));
   const explicitHybrid = /\bh[ií]brido\b|\b(?:paneles|sistema)\b.{0,40}\bbater[ií]as?\b/i.test(incoming);
-  if (wantsOffGrid) {
+  if (requestsBatteryPlan(incoming)) {
+    fields.product_interest = BATTERY_PLAN_PRODUCT;
+  } else if (wantsOffGrid) {
     fields.product_interest = "Sistema off-grid sin conexión a red";
   } else if (explicitHybrid || wantsBoth || (wantsSavings && wantsBackup)) {
     fields.product_interest = "Sistema híbrido con batería para ahorro y respaldo";
